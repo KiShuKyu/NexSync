@@ -1,0 +1,17 @@
+# NexSync Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core
+gitpython>=3.1.40          # Git operations from Python
+watchdog>=3.0.0            # File system monitoring
+
+# Networking
+paramiko>=3.3.1            # SSH/SFTP file transfer
+zeroconf>=0.115.0          # mDNS auto-discovery (like AirDrop)
+
+# CLI
+click>=8.1.7               # Beautiful CLI framework
+
+# System Tray
+pystray>=0.19.4            # Cross-platform system tray
+Pillow>=10.0.0             # Icon image generation (required by pystray)
