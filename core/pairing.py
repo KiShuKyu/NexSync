@@ -336,21 +336,16 @@ class PairingManager:
         }
 
     def _safe_get_username(self) -> str:
-        """Get GitHub username without crashing if not logged in."""
         try:
-            return self.auth.get_username()
+            return self.auth.get_email()
         except Exception:
             return "unknown"
 
     def _verify_peer_identity(self, msg: dict) -> bool:
-        """
-        Verify the peer is logged into the same GitHub account.
-        This is the security check — only your own machines can pair.
-        """
         try:
-            our_username = self.auth.get_username()
-            peer_username = msg.get("username", "")
-            return our_username == peer_username and peer_username != "unknown"
+            our_identity = self.auth.get_email()
+            peer_identity = msg.get("username", "")
+            return our_identity == peer_identity and peer_identity != "unknown"
         except Exception:
             return False
 
