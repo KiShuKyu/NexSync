@@ -1,53 +1,44 @@
 # NexSync 🔄
 
-> Git-powered cross-platform file sync for Mac and Windows — peer-to-peer, no cloud required.
+> Git-powered cross-platform file sync between Windows and Mac — peer-to-peer, no cloud required for file transfer.
+
+Built by [KiShuKyu](https://github.com/KiShuKyu) · Python · Supabase · SSH · Textual TUI
 
 ---
 
 ## What is NexSync?
 
-NexSync is like having **Dropbox + Git** without any cloud dependency.
+NexSync is like **Dropbox + Git** without storing your files in anyone's cloud.
 
-- **On same WiFi** → files sync automatically in the background
-- **Off network** → changes are saved locally with git commits
-- **Push/Pull** → when you're back on the network, sync manually like git
+- **Same WiFi** → files sync automatically in the background via SSH
+- **Off network** → changes committed locally via git, synced when back online
+- **Cross-platform** → Windows ↔ Mac ↔ Linux
+- **Git-powered** → every sync is a commit, full history, conflict detection
+- **No file size limits** → SSH transfers directly between machines
 
----
+### What goes where
 
-## Installation
-
-```bash
-# 1. Clone the repo
-git clone https://github.com/yourname/nexsync
-cd nexsync
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Install as a CLI tool (makes 'nexsync' command available globally)
-pip install -e .
-```
+| Data | Where |
+|---|---|
+| Your files | SSH transfer — machine to machine only |
+| Git history | Local on each machine |
+| Auth + pairing + queue | Supabase (metadata only, never file content) |
+| Images/binary files | SSH on LAN, Supabase Storage temporarily off-network |
 
 ---
 
-## Quick Start
+## Tech Stack
 
-```bash
-# Initialize on your first machine (Mac)
-nexsync init
-
-# Initialize on your second machine (Windows)
-nexsync init
-
-# Check status
-nexsync status
-
-# Start background watcher (auto-syncs when on LAN)
-nexsync watch
-
-# Open web dashboard
-nexsync dashboard
-```
+| Layer | Library | Purpose |
+|---|---|---|
+| File versioning | `gitpython` | Track changes, history, conflict detection |
+| File watching | `watchdog` | Detect changes in real time |
+| Transfer | `paramiko` | SSH/SFTP file transfer |
+| Discovery | `zeroconf` | Auto-find peers on LAN |
+| Auth + Pairing | `supabase` | Email/password auth, device registry, queue |
+| TUI | `textual` | Terminal setup wizard |
+| CLI | `click` | All commands |
+| Tray | `pystray` | System tray icon (Windows) |
 
 ---
 
@@ -55,75 +46,50 @@ nexsync dashboard
 
 | Command | Description |
 |---|---|
-| `nexsync init` | First-time setup wizard |
-| `nexsync status` | Show pending changes + network info |
-| `nexsync push` | Commit + push to peer machine |
-| `nexsync pull` | Pull latest from peer machine |
-| `nexsync log` | Show sync history |
-| `nexsync diff` | Show uncommitted changes |
-| `nexsync resolve` | Resolve sync conflicts |
-| `nexsync discover` | Auto-find peers on local network |
-| `nexsync dashboard` | Open web UI at localhost:5050 |
-| `nexsync config --show` | View current config |
-| `nexsync config --set KEY VALUE` | Update a config value |
+| `python main.py start` | Start the sync daemon |
+| `python main.py status` | Show peer status + pending changes |
+| `python main.py push` | Commit + push to peer |
+| `python main.py pull` | Pull latest from peer |
+| `python main.py pair --mode host` | Pair with another machine (host side) |
+| `python main.py pair --mode join` | Pair with another machine (join side) |
+| `python main.py share <file>` | Share a file with caption |
+| `python main.py queue` | Review queued files waiting to send |
+| `python main.py log` | Show sync history |
+| `python main.py diff` | Show uncommitted changes |
+| `python main.py resolve` | Resolve merge conflicts |
+| `python main.py config` | View config |
+| `python main.py config --set KEY VALUE` | Update a config value |
 
 ---
 
 ## How It Works
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                    NEXSYNC PIPELINE                  │
-│                                                        │
-│  1. INIT         2. WATCH          3. DETECT           │
-│  git repo in     watchdog monitors socket checks if    │
-│  sync folder     your folder       peer is reachable   │
-│       │               │                  │             │
-│       └───────────────┴──────────┬────────┘            │
-│                                  ▼                     │
-│                        ┌─────────────────┐             │
-│                        │  Same Network?  │             │
-│                        └────────┬────────┘             │
-│                   YES           │         NO           │
-│                    ▼            │          ▼           │
-│              Auto sync          │     Save locally     │
-│              over SSH           │     (git commit)     │
-│                                 │     Manual push      │
-└─────────────────────────────────┴──────────────────────┘
+File changed in sync folder
+        │
+        ▼
+watchdog detects change
+        │
+        ▼
+git commits locally
+        │
+        ▼
+   Peer reachable?
+   /            \
+ YES             NO
+  │               │
+  ▼               ▼
+SSH transfer    Save locally
+to peer         Supabase queue
+                updated
+                │
+                ▼
+           Peer comes back online
+           Supabase Realtime fires
+                │
+                ▼
+           Confirm + transfer
 ```
-
-### Tech Stack
-
-| Layer | Library | Purpose |
-|---|---|---|
-| Versioning | `gitpython` | Track changes, history, conflicts |
-| File watching | `watchdog` | Detect file changes in real time |
-| Networking | `paramiko` | SSH/SFTP file transfer |
-| Discovery | `zeroconf` | Auto-find peers on LAN (like AirDrop) |
-| CLI | `click` | Terminal commands |
-| Web UI | `flask` | Browser dashboard |
-| Tray | `pystray` | System tray icon |
-
----
-
-## SSH Setup (Required for Push/Pull)
-
-NexSync uses SSH to transfer files securely. You need to set up SSH keys between your machines:
-
-```bash
-# On Mac — generate SSH key (if you don't have one)
-ssh-keygen -t ed25519 -C "nexsync"
-
-# Copy your public key to the Windows machine
-ssh-copy-id username@WINDOWS_IP
-
-# Test it works
-ssh username@WINDOWS_IP
-```
-
-On Windows, you need OpenSSH installed:
-- Settings → Apps → Optional Features → Add "OpenSSH Server"
-- Start the service: `Start-Service sshd`
 
 ---
 
@@ -132,72 +98,52 @@ On Windows, you need OpenSSH installed:
 ```
 nexsync/
 ├── core/
-│   ├── config.py        # Configuration management
-│   ├── git_engine.py    # Git operations (commit, log, diff, conflicts)
+│   ├── config.py        # Configuration (~/.nexsync/config.json)
+│   ├── auth.py          # Supabase email/password auth
+│   ├── database.py      # Supabase client wrapper
+│   ├── git_engine.py    # Git operations
 │   ├── watcher.py       # File system monitoring + auto-sync
-│   ├── network.py       # LAN detection, SSH transfer, mDNS discovery
+│   ├── network.py       # SSH transfer + LAN detection
+│   ├── pairing.py       # UDP broadcast pairing
+│   ├── sharing.py       # File sharing + queue
 │   └── conflict.py      # Conflict detection and resolution
 ├── cli/
-│   └── commands.py      # All CLI commands (push, pull, status, etc.)
+│   ├── commands.py      # CLI commands
+│   ├── share_commands.py
+│   └── setup_wizard.py  # Textual TUI setup wizard
 ├── ui/
-│   ├── dashboard.py     # Flask web dashboard
-│   └── tray.py          # System tray icon
+│   ├── tray.py          # System tray icon
+│   └── share_ui.py      # Share UI
+├── schema.sql           # Supabase database schema
 ├── main.py              # Entry point
 ├── requirements.txt
 ├── setup.py
-└── README.md
-```
-
----
-
-## Configuration
-
-Config is stored at `~/.nexsync/config.json`:
-
-```json
-{
-  "sync_folder": "/Users/you/NexSync",
-  "peer_ip": "192.168.1.10",
-  "peer_port": 22,
-  "peer_username": "windowsuser",
-  "peer_sync_folder": "C:/Users/windowsuser/NexSync",
-  "ssh_key_path": "~/.ssh/id_ed25519",
-  "auto_sync": true,
-  "sync_interval": 5,
-  "ignore_patterns": [".git", "__pycache__", "*.pyc", ".DS_Store"]
-}
-```
-
----
-
-## Conflict Resolution
-
-If both machines edit the same file while offline:
-
-```bash
-# See what's conflicting
-nexsync status
-
-# Interactive resolution (choose file by file)
-nexsync resolve
-
-# Keep all your local versions
-nexsync resolve --all-local
-
-# Keep all remote versions
-nexsync resolve --all-remote
+└── SETUP.md             # Step-by-step setup guide
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] Relay server for off-network sync without manual push
-- [ ] End-to-end encryption for transfers
-- [ ] Mobile app (iOS/Android) for monitoring
-- [ ] Selective folder sync with `.syncignore`
-- [ ] Bandwidth throttling
-- [ ] Delta sync (only transfer changed parts of files)
+- [x] Git-powered local versioning
+- [x] SSH file transfer on LAN
+- [x] Supabase auth (email + password)
+- [x] Device registry + pairing via Supabase
+- [x] File watcher with auto-sync
+- [x] Textual TUI setup wizard
+- [ ] Supabase Storage for off-network transfers
+- [ ] Supabase Realtime pairing (cross-network)
+- [ ] System tray icon (Windows)
+- [ ] Notifications (plyer)
+- [ ] Custom folder icon
+- [ ] Phase 2: Own FastAPI backend
+- [ ] Phase 3: Go daemon + WinFSP virtual drive
+
+---
+
+## Setup
+
+See **[SETUP.md](SETUP.md)** for the complete step-by-step setup guide.
 
 ---
 

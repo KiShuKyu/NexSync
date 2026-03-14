@@ -334,7 +334,6 @@ class PairingManager:
             "version": "1.0.0",
             "timestamp": time.time()
         }
-
     def _safe_get_username(self) -> str:
         try:
             return self.auth.get_email()

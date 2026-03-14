@@ -1,8 +1,3 @@
-"""
-NexSync Configuration Manager
-Handles all config read/write operations via config.json
-"""
-
 import json
 import os
 from pathlib import Path

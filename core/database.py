@@ -1,16 +1,3 @@
-"""
-NexSync — core/database.py
-Supabase client wrapper. All DB operations live here.
-Every other module imports from this file — nothing else touches Supabase directly.
-
-Tables:
-  users     — who owns this NexSync install
-  devices   — each machine running NexSync
-  pairs     — two machines paired together
-  queue     — files queued to send (metadata only)
-  sync_log  — history of every sync event
-"""
-
 import json
 import uuid
 import platform
@@ -21,7 +8,6 @@ from typing import Optional
 
 from supabase import create_client, Client
 
-# ── Config paths ──────────────────────────────────────────────────────────────
 CONFIG_DIR   = Path.home() / ".nexsync"
 SESSION_FILE = CONFIG_DIR / "session.json"
 CONFIG_FILE  = CONFIG_DIR / "config.json"
@@ -32,14 +18,6 @@ class DatabaseError(Exception):
 
 
 class NexSyncDB:
-    """
-    Single Supabase client shared across all NexSync modules.
-    Instantiate once in main.py and pass around.
-
-    Usage:
-        db = NexSyncDB(url="https://xxx.supabase.co", key="anon-key")
-        db.register_device(user_id, hostname, machine_id, ...)
-    """
 
     def __init__(self, url: str = None, key: str = None):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,8 +37,6 @@ class NexSyncDB:
         self.client: Client = create_client(url, key)
         self._user_id: Optional[str] = None
         self._device_id: Optional[str] = None
-
-    # ── Credentials ───────────────────────────────────────────────────────────
 
     def _load_credentials(self) -> tuple[str, str]:
         """Load Supabase URL + key from config.json."""
@@ -85,8 +61,6 @@ class NexSyncDB:
         config["supabase_url"] = url
         config["supabase_key"] = key
         CONFIG_FILE.write_text(json.dumps(config, indent=2))
-
-    # ── Session ───────────────────────────────────────────────────────────────
 
     def save_session(self, session) -> None:
         """Persist Supabase auth session to disk."""
@@ -137,8 +111,6 @@ class NexSyncDB:
         session = self.load_session()
         return session.get("user_id") if session else None
 
-    # ── Auth ──────────────────────────────────────────────────────────────────
-
     def sign_up(self, email: str, password: str) -> dict:
         """
         Register a new user.
@@ -171,8 +143,6 @@ class NexSyncDB:
     def sign_out(self) -> None:
         self.clear_session()
 
-    # ── Devices ───────────────────────────────────────────────────────────────
-
     @staticmethod
     def get_machine_id() -> str:
         """
@@ -200,9 +170,8 @@ class NexSyncDB:
         machine_id = self.get_machine_id()
         hostname   = hostname or socket.gethostname()
         local_ip   = self._get_local_ip()
-        os_name    = platform.system().lower()  # windows / darwin / linux
+        os_name    = platform.system().lower()  
 
-        # Upsert — insert if new, update if exists (match on machine_id)
         try:
             res = (
                 self.client.table("devices")
@@ -274,10 +243,6 @@ class NexSyncDB:
             return None
 
     def get_paired_device(self) -> Optional[dict]:
-        """
-        Get the device that is paired with this machine.
-        Returns the OTHER machine's device row.
-        """
         device_id = self._device_id
         if not device_id:
             d = self.get_device()
@@ -286,7 +251,6 @@ class NexSyncDB:
             device_id = d["id"]
 
         try:
-            # Find pair where this device is either device_1 or device_2
             res = (
                 self.client.table("pairs")
                 .select("*, device_1:devices!pairs_device_1_id_fkey(*), device_2:devices!pairs_device_2_id_fkey(*)")
@@ -304,13 +268,7 @@ class NexSyncDB:
         except Exception:
             return None
 
-    # ── Pairing ───────────────────────────────────────────────────────────────
-
     def get_online_devices(self) -> list[dict]:
-        """
-        Get all online devices for this user (excluding this machine).
-        Used for pairing — shows available machines.
-        """
         user_id    = self.get_user_id()
         machine_id = self.get_machine_id()
         try:
@@ -327,10 +285,6 @@ class NexSyncDB:
             return []
 
     def create_pair(self, other_device_id: str) -> dict:
-        """
-        Create a pairing between this machine and another.
-        Raises DatabaseError if already paired.
-        """
         device_id = self._device_id
         if not device_id:
             d = self.get_device()
@@ -354,13 +308,6 @@ class NexSyncDB:
             raise DatabaseError(f"Pairing failed: {e}")
 
     def subscribe_to_pairing(self, callback) -> None:
-        """
-        Subscribe to Supabase Realtime on the devices table.
-        Fires callback(payload) instantly when another device comes online.
-
-        Usage:
-            db.subscribe_to_pairing(lambda p: print("Peer online:", p))
-        """
         user_id = self.get_user_id()
         channel = self.client.realtime.channel(f"pairing-{user_id}")
         channel.on_postgres_changes(
@@ -373,7 +320,6 @@ class NexSyncDB:
         channel.subscribe()
         return channel
 
-    # ── Queue ─────────────────────────────────────────────────────────────────
 
     def queue_file(
         self,
@@ -382,10 +328,6 @@ class NexSyncDB:
         file_size: int,
         caption: str = "",
     ) -> dict:
-        """
-        Add a file to the send queue (off-LAN).
-        Actual file stays locally in ~/.nexsync/queue/.
-        """
         sender_id = self._device_id
         if not sender_id:
             d = self.get_device()
@@ -410,7 +352,6 @@ class NexSyncDB:
             raise DatabaseError(f"Queue failed: {e}")
 
     def get_pending_queue(self) -> list[dict]:
-        """Get all pending files queued for this device to receive."""
         device_id = self._device_id
         if not device_id:
             d = self.get_device()
@@ -430,7 +371,6 @@ class NexSyncDB:
             return []
 
     def update_queue_status(self, queue_id: str, status: str) -> None:
-        """Update queue item status: pending → confirmed → sent."""
         try:
             (
                 self.client.table("queue")
@@ -442,10 +382,6 @@ class NexSyncDB:
             raise DatabaseError(f"Queue update failed: {e}")
 
     def subscribe_to_queue(self, callback) -> None:
-        """
-        Subscribe to Realtime on queue table.
-        Fires callback instantly when a file is queued for this device.
-        """
         device_id = self._device_id
         if not device_id:
             d = self.get_device()
@@ -462,17 +398,11 @@ class NexSyncDB:
         channel.subscribe()
         return channel
 
-    # ── Sync Log ──────────────────────────────────────────────────────────────
-
     def log_sync_event(
         self,
         action: str,
         filename: str = "",
     ) -> None:
-        """
-        Log a sync event.
-        action: "push" | "pull" | "share" | "conflict"
-        """
         device_id = self._device_id
         if not device_id:
             return
@@ -491,10 +421,6 @@ class NexSyncDB:
             pass  # Log failures are non-fatal
 
     def get_sync_log(self, limit: int = 50) -> list[dict]:
-        """
-        Get sync history from BOTH machines in one view.
-        This is better than git log — shows cross-machine history.
-        """
         user_id = self.get_user_id()
         try:
             res = (
@@ -508,8 +434,6 @@ class NexSyncDB:
             return res.data or []
         except Exception:
             return []
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _get_local_ip() -> str:

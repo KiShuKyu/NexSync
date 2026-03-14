@@ -1,9 +1,3 @@
-"""
-NexSync Git Engine
-Wraps gitpython to provide versioning, commit, push, pull, conflict detection.
-This is the core brain of NexSync.
-"""
-
 import os
 import time
 from datetime import datetime

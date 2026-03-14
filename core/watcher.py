@@ -1,11 +1,3 @@
-"""
-NexSync File Watcher
-Uses watchdog to monitor the sync folder.
-On changes:
-  - If peer is reachable → auto-commit + push
-  - If offline → just commit locally
-"""
-
 import time
 import threading
 from datetime import datetime

@@ -1,9 +1,3 @@
-"""
-NexSync CLI
-Professional command-line interface using Click.
-Commands: init, status, push, pull, log, diff, config, watch, resolve
-"""
-
 import os
 import sys
 import click
@@ -52,7 +46,6 @@ class CLI:
         self.watcher = watcher
 
     def run(self):
-        """Entry point — parse and dispatch CLI commands."""
         cli = self._build_cli()
         cli(standalone_mode=True)
 
@@ -65,7 +58,7 @@ class CLI:
 
         @click.group()
         def cli():
-            """NexSync — Git-like cross-platform file sync"""
+
             pass
 
         # ─────────────────────────

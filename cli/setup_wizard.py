@@ -1,13 +1,3 @@
-"""
-NexSync Setup Wizard — Textual TUI
-A beautiful terminal UI that guides the user through:
-1. GitHub login (OAuth Device Flow)
-2. Sync folder selection
-3. Machine pairing (host or join)
-
-Run with: python -m cli.setup_wizard
-"""
-
 import os
 import time
 import webbrowser
@@ -18,9 +8,6 @@ from textual.containers import Container, Horizontal
 from textual.widgets import Header, Footer, Button, Input, Static, RichLog
 from textual.screen import Screen
 from textual.binding import Binding
-
-
-# ── Logo ──────────────────────────────────────────────────────────────────────
 
 LOGO = """
 [bold cyan]
@@ -128,11 +115,6 @@ class WelcomeScreen(Screen):
 
 
 class AuthScreen(Screen):
-    """
-    Step 1 of 3 — Supabase email + password login.
-    Replaces GitHubLoginScreen entirely.
-    No browser, no redirect, no polling — just an API call.
-    """
     CSS = WIZARD_CSS
     BINDINGS = [Binding("escape", "go_back", "Back")]
 

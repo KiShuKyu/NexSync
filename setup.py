@@ -1,10 +1,3 @@
-"""
-NexSync setup.py
-Installs nexsync as a system-wide CLI command.
-Run: pip install -e .
-Then use: nexsync init / nexsync push / nexsync pull
-"""
-
 from setuptools import setup, find_packages
 
 setup(
@@ -25,7 +18,6 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            # This makes `nexsync` available as a terminal command
             "nexsync=cli.commands:CLI",
         ],
     },

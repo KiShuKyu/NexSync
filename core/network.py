@@ -1,12 +1,3 @@
-"""
-NexSync Network Manager
-Handles:
-- LAN peer detection (is peer reachable?)
-- Auto-discovery via mDNS/Zeroconf
-- File transfer over SSH (paramiko)
-- Relay server support for off-network sync
-"""
-
 import os
 import socket
 import threading

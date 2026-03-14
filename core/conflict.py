@@ -1,9 +1,3 @@
-"""
-NexSync Conflict Resolver
-Handles merge conflicts between local and remote changes.
-Provides diff viewing and resolution strategies.
-"""
-
 import os
 import difflib
 from typing import List, Optional
@@ -20,7 +14,6 @@ class ConflictFile:
         self.detected_at = datetime.now().isoformat()
 
     def get_diff(self) -> str:
-        """Generate a unified diff between local and remote."""
         local_lines = self.local_content.splitlines(keepends=True)
         remote_lines = self.remote_content.splitlines(keepends=True)
 

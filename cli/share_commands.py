@@ -1,38 +1,13 @@
-"""
-NexSync CLI — Share & Queue Commands
-Adds to existing CLI:
-  nexsync share <filepath> [--caption "text"]
-  nexsync queue
-"""
-
 import click
 import os
 
 
 def register_share_commands(cli, config, git_engine, network):
-    """
-    Call this from main CLI setup to add share + queue commands.
-    Keeps commands modular — easy to add/remove.
-    """
-
-    # ── nexsync share ───────────────────────────────────────────────────────
-
     @cli.command()
     @click.argument("filepath")
     @click.option("--caption", "-c", default="", help="Optional caption/message")
     @click.option("--no-ui", is_flag=True, help="Skip TUI, use plain terminal output")
     def share(filepath, caption, no_ui):
-        """
-        Share a file with your paired machine.
-
-        File goes directly over LAN (SSH). GitHub only stores the filename.
-        If peer is offline, file is queued until they reconnect.
-
-        Examples:
-          nexsync share photo.jpg
-          nexsync share photo.jpg --caption "check this out"
-          nexsync share ~/Downloads/doc.pdf -c "the report"
-        """
 
         filepath = os.path.expanduser(filepath)
 
@@ -47,23 +22,10 @@ def register_share_commands(cli, config, git_engine, network):
             # Beautiful TUI mode
             from ui.share_ui import run_share
             run_share(filepath, config, network, git_engine)
-
-    # ── nexsync queue ───────────────────────────────────────────────────────
-
+        
     @cli.command()
     @click.option("--no-ui", is_flag=True, help="Skip TUI, use plain terminal output")
     def queue(no_ui):
-        """
-        View and send queued files.
-
-        Files are queued when your peer is offline.
-        Run this command when you're back on the same WiFi
-        to review and confirm each file before sending.
-
-        Example:
-          nexsync queue
-        """
-
         from core.sharing import QueueManager
         qm = QueueManager()
 
@@ -87,18 +49,15 @@ def register_share_commands(cli, config, git_engine, network):
             from ui.share_ui import run_queue
             run_queue(config, network, git_engine)
 
-    # ── nexsync queue-status ────────────────────────────────────────────────
 
     @cli.command(name="queue-status")
     def queue_status():
-        """Show what's in the queue without sending anything."""
         from core.sharing import QueueManager
         qm = QueueManager()
         click.echo(qm.get_queue_summary())
 
 
 def _share_plain(filepath, caption, config, network, git_engine):
-    """Plain terminal sharing — no TUI."""
 
     from core.sharing import ShareManager
     import os
@@ -129,8 +88,6 @@ def _share_plain(filepath, caption, config, network, git_engine):
 
 
 def _queue_plain(config, network, git_engine):
-    """Plain terminal queue processing — no TUI."""
-
     from core.sharing import QueueManager, ShareManager
 
     qm    = QueueManager()
@@ -140,7 +97,7 @@ def _queue_plain(config, network, git_engine):
     click.echo(f"\n{len(items)} file(s) queued:\n")
 
     for item in items:
-        click.echo(f"  📄  {item.filename}  ({item.size_display()})")
+        click.echo(f" {item.filename}  ({item.size_display()})")
         if item.caption:
             click.echo(f"      \"{item.caption}\"")
         click.echo(f"      Queued: {item.queued_at[:16]}\n")
@@ -170,7 +127,6 @@ def _queue_plain(config, network, git_engine):
 
 
 def _show_queue_list(items):
-    """Print queued files without taking action."""
     for item in items:
         click.echo(f"  • {item.filename}  {item.size_display()}  — {item.queued_at[:16]}")
         if item.caption:
