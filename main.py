@@ -38,11 +38,11 @@ from core.auth import NexSyncAuth, AuthError
 from core.watcher import FileWatcher
 from core.network import NetworkManager
 from core.git_engine import GitEngine
-from core.sharing import ShareManager
+from core.sharing import SharingManager
 from core.conflict import ConflictResolver
 from core.pairing import PairingManager
-from cli.commands import CLI as commands_cli
-from cli.share_commands import _share_plain
+from cli.commands import cli as commands_cli
+from cli.share_commands import share_cli
 # from cli.setup_wizard import run_setup_wizard
 
 # ── Global state ──────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ def _start_tray(config: Config):
 
 
 # ── Watcher thread ────────────────────────────────────────────────────────────
-def _start_watcher(config: Config, git: GitEngine, network: NetworkManager, sharing: ShareManager):
+def _start_watcher(config: Config, git: GitEngine, network: NetworkManager, sharing: SharingManager):
     """Start watchdog file watcher in a daemon thread."""
     sync_folder = config.sync_folder
     if not sync_folder or not Path(sync_folder).exists():
@@ -91,7 +91,7 @@ def _start_watcher(config: Config, git: GitEngine, network: NetworkManager, shar
 
 
 # ── Peer-reconnect queue prompt loop ─────────────────────────────────────────
-def _reconnect_queue_loop(config: Config, network: NetworkManager, sharing: ShareManager):
+def _reconnect_queue_loop(config: Config, network: NetworkManager, sharing: SharingManager):
     """
     Background loop: once per minute, check if peer just came online.
     If yes, and there are queued files, ask user to confirm sending each one.
@@ -122,7 +122,7 @@ def _reconnect_queue_loop(config: Config, network: NetworkManager, sharing: Shar
         _stop_event.wait(timeout=60)
 
 
-def _prompt_queue(config: Config, sharing: ShareManager, queue: list):
+def _prompt_queue(config: Config, sharing: SharingManager, queue: list):
     """
     Called when peer reconnects with pending queued files.
     Prints to stdout so the user sees it in whatever terminal NexSync is running in.
@@ -183,7 +183,7 @@ def _run_daemon(config: Config):
     db.load_session()
     git = GitEngine(config.sync_folder)
     _network = NetworkManager(config)
-    sharing = ShareManager(config, _network, git)
+    sharing = SharingManager(config, _network, git)
 
     _watcher = _start_watcher(config, git, _network, sharing)
     _tray = _start_tray(config)
@@ -280,7 +280,7 @@ def cmd_status(ctx):
         for f in pending[:10]:
             click.echo(f"    • {f}")
 
-    sharing = ShareManager(config, network)
+    sharing = SharingManager(config, network)
     queue = sharing.get_queue()
     if queue:
         click.echo(f"  Queued      : {len(queue)} file(s) waiting to send")
@@ -335,7 +335,7 @@ def cmd_share(ctx, file_path: str, caption: str):
     """Share a file or image with your paired machine."""
     config = ctx.obj["config"]
     network = NetworkManager(config)
-    sharing = ShareManager(config, network)
+    sharing = SharingManager(config, network)
     sharing.share_file(file_path, caption=caption)
 
 
@@ -345,7 +345,7 @@ def cmd_queue(ctx):
     """Review and confirm queued files waiting to send."""
     config = ctx.obj["config"]
     network = NetworkManager(config)
-    sharing = ShareManager(config, network)
+    sharing = SharingManager(config, network)
     queue = sharing.get_queue()
 
     if not queue:
@@ -431,30 +431,33 @@ def cmd_config(ctx, set_pair):
 
 
 @main.command("pair")
+@click.option("--mode", type=click.Choice(["host", "join"]), default=None)
 @click.pass_context
-def cmd_pair(ctx):
-    """Pair with another machine (LAN broadcast or GitHub relay fallback)."""
+def cmd_pair(ctx, mode):
+    """Pair with another machine via LAN UDP broadcast."""
     config = ctx.obj["config"]
     from core.database import NexSyncDB
     from core.auth import NexSyncAuth
     db = NexSyncDB()
     db.load_session()
     auth = NexSyncAuth(db)
-    pairing = PairingManager(config, auth)
+    pairing = PairingManager(auth, config)
 
-    click.echo("Looking for peer on LAN (UDP broadcast)...")
-    peer = pairing.discover_peer(timeout=10)
+    if not mode:
+        click.echo("Choose pairing mode:")
+        click.echo("  1. HOST - wait for other machine to join")
+        click.echo("  2. JOIN - find host on network")
+        choice = click.prompt("Enter 1 or 2")
+        mode = "host" if choice == "1" else "join"
 
-    if peer:
-        click.echo(f"Found: {peer['hostname']} ({peer['ip']})")
-        if click.confirm("Pair with this machine?"):
-            pairing.complete_pairing(peer)
-            click.echo("Paired successfully.")
+    if mode == "host":
+        click.echo("HOST mode - broadcasting. Run pair --mode join on the other machine...")
+        peer = pairing.host(on_status=click.echo)
     else:
-        click.echo("No peer found on LAN.")
-        if click.confirm("Try pairing via GitHub relay (works across networks)?"):
-            click.echo("Initiating GitHub relay pairing...")
-            pairing.pair_via_github()
+        click.echo("JOIN mode - searching for host...")
+        peer = pairing.join(on_status=click.echo)
+
+    click.echo(f"\nPaired with {peer.hostname} ({peer.local_ip})")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
