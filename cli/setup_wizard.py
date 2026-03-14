@@ -13,7 +13,6 @@ import time
 import webbrowser
 from pathlib import Path
 
-import httpx
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal
 from textual.widgets import Header, Footer, Button, Input, Static, RichLog
@@ -123,12 +122,17 @@ class WelcomeScreen(Screen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-start":
-            self.app.push_screen(GitHubLoginScreen())
+            self.app.push_screen(AuthScreen())
         elif event.button.id == "btn-skip":
             self.app.push_screen(PairingScreen())
 
 
-class GitHubLoginScreen(Screen):
+class AuthScreen(Screen):
+    """
+    Step 1 of 3 — Supabase email + password login.
+    Replaces GitHubLoginScreen entirely.
+    No browser, no redirect, no polling — just an API call.
+    """
     CSS = WIZARD_CSS
     BINDINGS = [Binding("escape", "go_back", "Back")]
 
@@ -140,132 +144,102 @@ class GitHubLoginScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Container(classes="wizard-container"):
-            yield Static("Step 1 of 3 - GitHub Login", classes="step-title")
+            yield Static("Step 1 of 3 — Create Account / Sign In", classes="step-title")
             yield Static(
-                "NexSync uses your GitHub account to identify your machines and sync files "
-                "when you're away from home. No extra accounts needed.",
+                "NexSync uses a free Supabase account to sync your machines. "
+                "No GitHub needed.",
                 classes="step-desc"
             )
             yield Static("")
-            yield Static("1. A browser window will open -> github.com/login/device", classes="dim-text")
-            yield Static("2. Enter the code shown below", classes="dim-text")
-            yield Static("3. Click Authorize -- done!", classes="dim-text")
+            yield Static("Email:", classes="dim-text")
+            yield Input(placeholder="you@email.com", id="input-email")
+            yield Static("Password:", classes="dim-text")
+            yield Input(placeholder="min 6 characters", password=True, id="input-password")
+            yield Static("", id="auth-status", classes="status-line")
             yield Static("")
-            yield Static("", id="code-display")
-            yield RichLog(id="login-log", classes="log-box", markup=True)
-            yield Static("", id="login-status", classes="status-line")
             with Horizontal(classes="btn-row"):
-                yield Button("Login with GitHub ->", id="btn-login", variant="primary")
-                yield Button("<- Back", id="btn-back", variant="default")
+                yield Button("Sign In",      id="btn-signin",  variant="primary")
+                yield Button("Create Account", id="btn-signup", variant="default")
+                yield Button("<- Back",      id="btn-back",   variant="default")
         yield Footer()
 
     def on_mount(self) -> None:
+        """Check if already logged in."""
         try:
-            from core.auth import GitHubAuth
-            self._auth = GitHubAuth()
+            from core.database import NexSyncDB
+            from core.auth import NexSyncAuth
+            db = NexSyncDB()
+            self._auth = NexSyncAuth(db)
             if self._auth.is_logged_in():
-                username = self._auth.get_username()
-                self.query_one("#login-status", Static).update(
-                    f"[green]Already logged in as @{username}[/green]"
+                email = self._auth.get_email()
+                self.query_one("#auth-status", Static).update(
+                    f"[green]Already signed in as {email}[/green]"
                 )
                 self._login_done = True
-                self.query_one("#btn-login", Button).label = f"Continue as @{username} ->"
-                self.query_one("#btn-login", Button).variant = "success"
+                self.query_one("#btn-signin", Button).label = f"Continue as {email} ->"
+                self.query_one("#btn-signin", Button).variant = "success"
         except Exception:
             pass
-    
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn-login":
+        if event.button.id == "btn-signin":
             if self._login_done:
                 self.app.push_screen(FolderScreen(self._auth))
             else:
-                self.run_worker(self._do_login)
+                self.run_worker(self._do_signin)
+        elif event.button.id == "btn-signup":
+            self.run_worker(self._do_signup)
         elif event.button.id == "btn-back":
             self.app.pop_screen()
 
     def action_go_back(self):
         self.app.pop_screen()
 
-    async def _do_login(self) -> None:
-        import asyncio
-        log    = self.query_one("#login-log", RichLog)
-        status = self.query_one("#login-status", Static)
-        btn    = self.query_one("#btn-login", Button)
-        btn.disabled = True
+    async def _do_signin(self) -> None:
+        await self._do_auth("signin")
+
+    async def _do_signup(self) -> None:
+        await self._do_auth("signup")
+
+    async def _do_auth(self, mode: str) -> None:
+        status = self.query_one("#auth-status", Static)
+        email    = self.query_one("#input-email",    Input).value.strip()
+        password = self.query_one("#input-password", Input).value.strip()
+
+        # Disable buttons during request
+        self.query_one("#btn-signin", Button).disabled = True
+        self.query_one("#btn-signup", Button).disabled = True
+
+        status.update("[cyan]Connecting...[/cyan]")
 
         try:
-            from core.auth import GitHubAuth
-            self._auth = GitHubAuth()
-            if not self._auth.client_id:
-                log.write("[red]GitHub Client ID not set![/red]")
-                log.write("[yellow]Open core/auth.py and paste your Client ID[/yellow]")
-                log.write("[dim]github.com/settings/developers -> OAuth Apps -> New OAuth App[/dim]")
-                btn.disabled = False
-                return
+            from core.database import NexSyncDB
+            from core.auth import NexSyncAuth, AuthError
 
-            log.write("[cyan]Requesting GitHub authorization...[/cyan]")
-            device_data = self._auth._request_device_code()
+            db = NexSyncDB()
+            self._auth = NexSyncAuth(db)
 
-            user_code   = device_data["user_code"]
-            verify_url  = device_data["verification_uri"]
-            expires_in  = device_data["expires_in"]
-            interval    = device_data["interval"]
-            device_code = device_data["device_code"]
-
-            self.query_one("#code-display", Static).update(
-                f"[bold yellow]  Your code:  [bold white]{user_code}[/bold white][/bold yellow]\n"
-                f"[dim]  Go to: {verify_url}[/dim]"
-            )
-            log.write(f"[green]Opening browser...[/green]")
-            log.write(f"[yellow]Enter code: {user_code}[/yellow]")
-            webbrowser.open(verify_url)
-            log.write("[dim]Waiting for you to authorize...[/dim]")
-
-            deadline = time.time() + expires_in
-            wait = interval
-
-            while time.time() < deadline:
-                await asyncio.sleep(wait)
-                response = httpx.post(
-                    "https://github.com/login/oauth/access_token",
-                    headers={"Accept": "application/json"},
-                    data={
-                        "client_id": self._auth.client_id,
-                        "device_code": device_code,
-                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    },
-                    timeout=10,
+            if mode == "signup":
+                result = self._auth.sign_up(email, password)
+                status.update(
+                    f"[green]Account created! Signed in as {result['email']}[/green]"
                 )
-                data = response.json()
+            else:
+                result = self._auth.sign_in(email, password)
+                status.update(
+                    f"[green]Signed in as {result['email']}[/green]"
+                )
 
-                if "access_token" in data:
-                    token = data["access_token"]
-                    user_info = self._auth._get_user_info(token)
-                    username = user_info["login"]
-                    self._auth.save_token(token, username)
-                    log.write(f"[green bold]Logged in as @{username}![/green bold]")
-                    status.update(f"[green]Logged in as @{username}[/green]")
-                    self._login_done = True
-                    btn.label = "Continue ->"
-                    btn.variant = "success"
-                    btn.disabled = False
-                    await asyncio.sleep(1.5)
-                    self.app.push_screen(FolderScreen(self._auth))
-                    return
+            self._login_done = True
 
-                error = data.get("error", "")
-                if error == "slow_down":
-                    wait += 5
-                elif error in ("expired_token", "access_denied"):
-                    break
-
-            status.update("[red]Login timed out. Try again.[/red]")
-            btn.disabled = False
+            import asyncio
+            await asyncio.sleep(1.0)
+            self.app.push_screen(FolderScreen(self._auth))
 
         except Exception as e:
-            log.write(f"[red]Error: {e}[/red]")
-            status.update("[red]Login failed.[/red]")
-            btn.disabled = False
+            status.update(f"[red]{e}[/red]")
+            self.query_one("#btn-signin", Button).disabled = False
+            self.query_one("#btn-signup", Button).disabled = False
 
 
 class FolderScreen(Screen):
@@ -356,8 +330,9 @@ class PairingScreen(Screen):
             self._config = Config()
         if not self._auth:
             try:
-                from core.auth import GitHubAuth
-                self._auth = GitHubAuth()
+                from core.database import NexSyncDB
+                from core.auth import NexSyncAuth
+                self._auth = NexSyncAuth(NexSyncDB())
             except Exception:
                 pass
 

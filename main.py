@@ -34,19 +34,19 @@ log = logging.getLogger("nexsync.main")
 
 # ── Lazy imports (only after logging is up) ───────────────────────────────────
 from core.config import Config
-from core.auth import GitHubAuth, AuthError
-from core.watcher import SyncWatcher
+from core.auth import NexSyncAuth, AuthError
+from core.watcher import FileWatcher
 from core.network import NetworkManager
 from core.git_engine import GitEngine
-from core.sharing import SharingManager
+from core.sharing import ShareManager
 from core.conflict import ConflictResolver
 from core.pairing import PairingManager
-from cli.commands import cli as commands_cli
-from cli.share_commands import share_cli
-from cli.setup_wizard import run_setup_wizard
+from cli.commands import CLI as commands_cli
+from cli.share_commands import _share_plain
+# from cli.setup_wizard import run_setup_wizard
 
 # ── Global state ──────────────────────────────────────────────────────────────
-_watcher: SyncWatcher | None = None
+_watcher: FileWatcher | None = None
 _tray = None
 _network: NetworkManager | None = None
 _stop_event = threading.Event()
@@ -71,19 +71,18 @@ def _start_tray(config: Config):
 
 
 # ── Watcher thread ────────────────────────────────────────────────────────────
-def _start_watcher(config: Config, git: GitEngine, network: NetworkManager, sharing: SharingManager):
+def _start_watcher(config: Config, git: GitEngine, network: NetworkManager, sharing: ShareManager):
     """Start watchdog file watcher in a daemon thread."""
     sync_folder = config.sync_folder
     if not sync_folder or not Path(sync_folder).exists():
         log.warning(f"Sync folder not found: {sync_folder!r} — watcher not started")
         return None
 
-    watcher = SyncWatcher(
-        sync_folder=sync_folder,
-        config=config,
+    watcher = FileWatcher(
+        folder_path=sync_folder,
         git_engine=git,
         network=network,
-        sharing=sharing,
+        config=config,
     )
     t = threading.Thread(target=watcher.start, daemon=True, name="watcher")
     t.start()
@@ -92,7 +91,7 @@ def _start_watcher(config: Config, git: GitEngine, network: NetworkManager, shar
 
 
 # ── Peer-reconnect queue prompt loop ─────────────────────────────────────────
-def _reconnect_queue_loop(config: Config, network: NetworkManager, sharing: SharingManager):
+def _reconnect_queue_loop(config: Config, network: NetworkManager, sharing: ShareManager):
     """
     Background loop: once per minute, check if peer just came online.
     If yes, and there are queued files, ask user to confirm sending each one.
@@ -123,7 +122,7 @@ def _reconnect_queue_loop(config: Config, network: NetworkManager, sharing: Shar
         _stop_event.wait(timeout=60)
 
 
-def _prompt_queue(config: Config, sharing: SharingManager, queue: list):
+def _prompt_queue(config: Config, sharing: ShareManager, queue: list):
     """
     Called when peer reconnects with pending queued files.
     Prints to stdout so the user sees it in whatever terminal NexSync is running in.
@@ -179,10 +178,12 @@ def _run_daemon(config: Config):
     """
     global _watcher, _tray, _network
 
-    auth = GitHubAuth()
+    from core.database import NexSyncDB
+    db = NexSyncDB()
+    db.load_session()
     git = GitEngine(config.sync_folder)
     _network = NetworkManager(config)
-    sharing = SharingManager(config, _network)
+    sharing = ShareManager(config, _network, git)
 
     _watcher = _start_watcher(config, git, _network, sharing)
     _tray = _start_tray(config)
@@ -242,7 +243,7 @@ def main(ctx: click.Context):
 def cmd_init(ctx):
     """Run the Textual TUI setup wizard."""
     config = ctx.obj["config"]
-    run_setup_wizard(config)
+    click.echo("Run: python -m cli.setup_wizard")
 
 
 @main.command("start")
@@ -279,7 +280,7 @@ def cmd_status(ctx):
         for f in pending[:10]:
             click.echo(f"    • {f}")
 
-    sharing = SharingManager(config, network)
+    sharing = ShareManager(config, network)
     queue = sharing.get_queue()
     if queue:
         click.echo(f"  Queued      : {len(queue)} file(s) waiting to send")
@@ -334,7 +335,7 @@ def cmd_share(ctx, file_path: str, caption: str):
     """Share a file or image with your paired machine."""
     config = ctx.obj["config"]
     network = NetworkManager(config)
-    sharing = SharingManager(config, network)
+    sharing = ShareManager(config, network)
     sharing.share_file(file_path, caption=caption)
 
 
@@ -344,7 +345,7 @@ def cmd_queue(ctx):
     """Review and confirm queued files waiting to send."""
     config = ctx.obj["config"]
     network = NetworkManager(config)
-    sharing = SharingManager(config, network)
+    sharing = ShareManager(config, network)
     queue = sharing.get_queue()
 
     if not queue:
@@ -434,7 +435,11 @@ def cmd_config(ctx, set_pair):
 def cmd_pair(ctx):
     """Pair with another machine (LAN broadcast or GitHub relay fallback)."""
     config = ctx.obj["config"]
-    auth = GitHubAuth()
+    from core.database import NexSyncDB
+    from core.auth import NexSyncAuth
+    db = NexSyncDB()
+    db.load_session()
+    auth = NexSyncAuth(db)
     pairing = PairingManager(config, auth)
 
     click.echo("Looking for peer on LAN (UDP broadcast)...")
