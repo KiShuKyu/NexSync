@@ -1,12 +1,17 @@
 import json
+import os
 import uuid
 import platform
 import socket
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from supabase import create_client, Client
+
+load_dotenv()
 
 CONFIG_DIR   = Path.home() / ".nexsync"
 SESSION_FILE = CONFIG_DIR / "session.json"
@@ -22,24 +27,25 @@ class NexSyncDB:
     def __init__(self, url: str = None, key: str = None):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Load from config if not passed directly
         if not url or not key:
             url, key = self._load_credentials()
 
         if not url or not key:
-            raise DatabaseError(
-                "Supabase URL and key not set.\n"
-                "Run 'nexsync init' to configure."
-            )
+            raise DatabaseError("Supabase URL and key not set. Run 'nexsync init'.")
 
         self._url = url
         self._key = key
         self.client: Client = create_client(url, key)
         self._user_id: Optional[str] = None
         self._device_id: Optional[str] = None
+        self._channels: list = []  # track open Realtime channels for cleanup
 
     def _load_credentials(self) -> tuple[str, str]:
-        """Load Supabase URL + key from config.json."""
+        # .env takes priority over config.json
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if url and key:
+            return url, key
         if not CONFIG_FILE.exists():
             return "", ""
         try:
@@ -50,7 +56,6 @@ class NexSyncDB:
 
     @staticmethod
     def save_credentials(url: str, key: str) -> None:
-        """Save Supabase URL + key to config.json."""
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         config = {}
         if CONFIG_FILE.exists():
@@ -63,7 +68,6 @@ class NexSyncDB:
         CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
     def save_session(self, session) -> None:
-        """Persist Supabase auth session to disk."""
         data = {
             "access_token":  session.access_token,
             "refresh_token": session.refresh_token,
@@ -76,13 +80,11 @@ class NexSyncDB:
         self._user_id = session.user.id
 
     def load_session(self) -> Optional[dict]:
-        """Load saved session from disk."""
         if not SESSION_FILE.exists():
             return None
         try:
             data = json.loads(SESSION_FILE.read_text())
             self._user_id = data.get("user_id")
-            # Restore session into supabase client
             self.client.auth.set_session(
                 data["access_token"],
                 data["refresh_token"]
@@ -92,7 +94,6 @@ class NexSyncDB:
             return None
 
     def clear_session(self) -> None:
-        """Log out — delete saved session."""
         if SESSION_FILE.exists():
             SESSION_FILE.unlink()
         self._user_id = None
@@ -112,11 +113,6 @@ class NexSyncDB:
         return session.get("user_id") if session else None
 
     def sign_up(self, email: str, password: str) -> dict:
-        """
-        Register a new user.
-        Returns user info dict.
-        Raises DatabaseError on failure.
-        """
         try:
             res = self.client.auth.sign_up({"email": email, "password": password})
             if res.session:
@@ -126,11 +122,6 @@ class NexSyncDB:
             raise DatabaseError(f"Sign up failed: {e}")
 
     def sign_in(self, email: str, password: str) -> dict:
-        """
-        Sign in existing user.
-        Returns user info dict.
-        Raises DatabaseError on failure.
-        """
         try:
             res = self.client.auth.sign_in_with_password(
                 {"email": email, "password": password}
@@ -145,10 +136,6 @@ class NexSyncDB:
 
     @staticmethod
     def get_machine_id() -> str:
-        """
-        Get or generate a stable machine UUID.
-        Stored in ~/.nexsync/machine_id so it never changes even if IP does.
-        """
         id_file = CONFIG_DIR / "machine_id"
         if id_file.exists():
             return id_file.read_text().strip()
@@ -156,21 +143,12 @@ class NexSyncDB:
         id_file.write_text(machine_id)
         return machine_id
 
-    def register_device(
-        self,
-        sync_folder: str,
-        hostname: str = None,
-    ) -> dict:
-        """
-        Register or update this machine in the devices table.
-        Called on startup and every time IP changes.
-        Returns the device row.
-        """
+    def register_device(self, sync_folder: str, hostname: str = None) -> dict:
         user_id    = self.get_user_id()
         machine_id = self.get_machine_id()
         hostname   = hostname or socket.gethostname()
         local_ip   = self._get_local_ip()
-        os_name    = platform.system().lower()  
+        os_name    = platform.system().lower()
 
         try:
             res = (
@@ -197,13 +175,15 @@ class NexSyncDB:
             raise DatabaseError(f"Device registration failed: {e}")
 
     def set_offline(self) -> None:
-        """Mark this device offline — called on clean shutdown."""
         if not self._device_id:
             return
         try:
             (
                 self.client.table("devices")
-                .update({"is_online": False, "last_seen": datetime.now(timezone.utc).isoformat()})
+                .update({
+                    "is_online": False,
+                    "last_seen": datetime.now(timezone.utc).isoformat()
+                })
                 .eq("id", self._device_id)
                 .execute()
             )
@@ -211,7 +191,6 @@ class NexSyncDB:
             pass
 
     def heartbeat(self) -> None:
-        """Update last_seen — call every 30s to show machine is alive."""
         if not self._device_id:
             return
         try:
@@ -229,7 +208,6 @@ class NexSyncDB:
             pass
 
     def get_device(self, machine_id: str = None) -> Optional[dict]:
-        """Get device row by machine_id (defaults to this machine)."""
         mid = machine_id or self.get_machine_id()
         try:
             res = (
@@ -253,18 +231,18 @@ class NexSyncDB:
         try:
             res = (
                 self.client.table("pairs")
-                .select("*, device_1:devices!pairs_device_1_id_fkey(*), device_2:devices!pairs_device_2_id_fkey(*)")
+                .select(
+                    "*, "
+                    "device_1:devices!pairs_device_1_id_fkey(*), "
+                    "device_2:devices!pairs_device_2_id_fkey(*)"
+                )
                 .or_(f"device_1_id.eq.{device_id},device_2_id.eq.{device_id}")
                 .execute()
             )
             if not res.data:
                 return None
-
             pair = res.data[0]
-            # Return the OTHER device
-            if pair["device_1_id"] == device_id:
-                return pair["device_2"]
-            return pair["device_1"]
+            return pair["device_2"] if pair["device_1_id"] == device_id else pair["device_1"]
         except Exception:
             return None
 
@@ -307,19 +285,68 @@ class NexSyncDB:
         except Exception as e:
             raise DatabaseError(f"Pairing failed: {e}")
 
+    # Realtime subscriptions 
+
+    def subscribe_to_queue(self, callback) -> None:
+        device_id = self._device_id
+        if not device_id:
+            d = self.get_device()
+            device_id = d["id"] if d else None
+
+        if not device_id:
+            print("[DB] Cannot subscribe to queue — device not registered")
+            return
+
+        channel = (
+            self.client
+            .channel(f"queue-{device_id}")
+            .on_postgres_changes(
+                event="INSERT",
+                schema="public",
+                table="queue",
+                filter=f"receiver_id=eq.{device_id}",
+                callback=lambda payload: callback(payload)
+            )
+            .subscribe()
+        )
+        self._channels.append(channel)
+        self._ensure_realtime_running()
+
     def subscribe_to_pairing(self, callback) -> None:
         user_id = self.get_user_id()
-        channel = self.client.realtime.channel(f"pairing-{user_id}")
-        channel.on_postgres_changes(
-            event="*",
-            schema="public",
-            table="devices",
-            filter=f"user_id=eq.{user_id}",
-            callback=callback,
-        )
-        channel.subscribe()
-        return channel
+        if not user_id:
+            return
 
+        channel = (
+            self.client
+            .channel(f"devices-{user_id}")
+            .on_postgres_changes(
+                event="UPDATE",
+                schema="public",
+                table="devices",
+                filter=f"user_id=eq.{user_id}",
+                callback=lambda payload: callback(payload)
+            )
+            .subscribe()
+        )
+        self._channels.append(channel)
+        self._ensure_realtime_running()
+
+    def _ensure_realtime_running(self):
+        # supabase-py v2 Realtime runs on its own WebSocket thread.
+        # Calling connect() is idempotent — safe to call multiple times.
+        try:
+            self.client.realtime.connect()
+        except Exception as e:
+            print(f"[DB] Realtime connect warning: {e}")
+
+    def close_realtime(self):
+        try:
+            self.client.realtime.disconnect()
+        except Exception:
+            pass
+
+    # Queue 
 
     def queue_file(
         self,
@@ -349,7 +376,7 @@ class NexSyncDB:
             )
             return res.data[0]
         except Exception as e:
-            raise DatabaseError(f"Queue failed: {e}")
+            raise DatabaseError(f"Queue insert failed: {e}")
 
     def get_pending_queue(self) -> list[dict]:
         device_id = self._device_id
@@ -381,36 +408,16 @@ class NexSyncDB:
         except Exception as e:
             raise DatabaseError(f"Queue update failed: {e}")
 
-    def subscribe_to_queue(self, callback) -> None:
-        device_id = self._device_id
-        if not device_id:
-            d = self.get_device()
-            device_id = d["id"] if d else None
+    # Logging 
 
-        channel = self.client.realtime.channel(f"queue-{device_id}")
-        channel.on_postgres_changes(
-            event="INSERT",
-            schema="public",
-            table="queue",
-            filter=f"receiver_id=eq.{device_id}",
-            callback=callback,
-        )
-        channel.subscribe()
-        return channel
-
-    def log_sync_event(
-        self,
-        action: str,
-        filename: str = "",
-    ) -> None:
-        device_id = self._device_id
-        if not device_id:
+    def log_sync_event(self, action: str, filename: str = "") -> None:
+        if not self._device_id:
             return
         try:
             (
                 self.client.table("sync_log")
                 .insert({
-                    "device_id": device_id,
+                    "device_id": self._device_id,
                     "action":    action,
                     "filename":  filename,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -418,15 +425,22 @@ class NexSyncDB:
                 .execute()
             )
         except Exception:
-            pass  # Log failures are non-fatal
+            pass
 
     def get_sync_log(self, limit: int = 50) -> list[dict]:
-        user_id = self.get_user_id()
+        device_id = self._device_id
+        if not device_id:
+            d = self.get_device()
+            device_id = d["id"] if d else None
+
+        if not device_id:
+            return []
+
         try:
             res = (
                 self.client.table("sync_log")
                 .select("*, device:devices(hostname, platform)")
-                .eq("devices.user_id", user_id)
+                .eq("device_id", device_id)
                 .order("timestamp", desc=True)
                 .limit(limit)
                 .execute()
@@ -437,7 +451,6 @@ class NexSyncDB:
 
     @staticmethod
     def _get_local_ip() -> str:
-        """Get this machine's LAN IP address."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))

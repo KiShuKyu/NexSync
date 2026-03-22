@@ -2,13 +2,13 @@ import click
 import os
 
 
-def register_share_commands(cli, config, git_engine, network):
+def register_share_commands(cli, config, network, db=None):
+
     @cli.command()
     @click.argument("filepath")
     @click.option("--caption", "-c", default="", help="Optional caption/message")
     @click.option("--no-ui", is_flag=True, help="Skip TUI, use plain terminal output")
     def share(filepath, caption, no_ui):
-
         filepath = os.path.expanduser(filepath)
 
         if not os.path.exists(filepath):
@@ -16,53 +16,80 @@ def register_share_commands(cli, config, git_engine, network):
             return
 
         if no_ui:
-            # Plain terminal mode — no TUI
-            _share_plain(filepath, caption, config, network, git_engine)
+            _share_plain(filepath, caption, config, network, db)
         else:
-            # Beautiful TUI mode
-            from ui.share_ui import run_share
-            run_share(filepath, config, network, git_engine)
-        
+            try:
+                from ui.share_ui import run_share
+                run_share(filepath, config, network, db)
+            except ImportError:
+                # Fallback to plain if TUI not available
+                _share_plain(filepath, caption, config, network, db)
+
     @cli.command()
     @click.option("--no-ui", is_flag=True, help="Skip TUI, use plain terminal output")
     def queue(no_ui):
-        from core.sharing import QueueManager
-        qm = QueueManager()
+        """Review and download files waiting in Supabase Storage."""
+        if not db:
+            click.echo("\033[91m✗ Database not configured.\033[0m")
+            return
 
-        if qm.is_empty():
+        try:
+            pending = db.get_pending_queue()
+        except Exception as e:
+            click.echo(f"\033[91m✗ Could not fetch queue: {e}\033[0m")
+            return
+
+        if not pending:
             click.echo("\033[92m✓ Queue is empty — nothing pending\033[0m")
             return
 
-        peer_online = network.is_peer_reachable() if network else False
-        peer_name   = config.peer_hostname or config.peer_ip or "peer"
-
-        if not peer_online:
-            items = qm.get_all()
-            click.echo(f"\n\033[93m⚠  {len(items)} file(s) queued — but {peer_name} is offline\033[0m")
-            click.echo("   Come back when you're on the same WiFi.\n")
-            _show_queue_list(items)
-            return
+        peer_name = config.peer_hostname or config.peer_ip or "peer"
 
         if no_ui:
-            _queue_plain(config, network, git_engine)
+            _queue_plain(config, network, db, pending)
         else:
-            from ui.share_ui import run_queue
-            run_queue(config, network, git_engine)
-
+            try:
+                from ui.share_ui import run_queue
+                run_queue(config, network, db)
+            except ImportError:
+                _queue_plain(config, network, db, pending)
 
     @cli.command(name="queue-status")
     def queue_status():
-        from core.sharing import QueueManager
-        qm = QueueManager()
-        click.echo(qm.get_queue_summary())
+        """Show a summary of files waiting in Supabase Storage."""
+        if not db:
+            click.echo("\033[91m✗ Database not configured.\033[0m")
+            return
+
+        try:
+            pending = db.get_pending_queue()
+        except Exception as e:
+            click.echo(f"\033[91m✗ Could not fetch queue: {e}\033[0m")
+            return
+
+        if not pending:
+            click.echo("Queue is empty.")
+            return
+
+        click.echo(f"\nCloud queue ({len(pending)} file(s)):\n")
+        for item in pending:
+            mb      = item.get("file_size", 0) / 1_000_000
+            caption = item.get("caption", "")
+            ts      = item.get("queued_at", "")[:16]
+            click.echo(
+                f"  • {item['filename']}  {mb:.1f} MB  — queued {ts}"
+                + (f'  "{caption}"' if caption else "")
+            )
+        click.echo()
 
 
-def _share_plain(filepath, caption, config, network, git_engine):
+# ── Plain terminal implementations ───────────────────────────────────────────
 
+def _share_plain(filepath, caption, config, network, db):
+    """Plain terminal share — no TUI dependency."""
     from core.sharing import ShareManager
-    import os
 
-    filename = os.path.basename(filepath)
+    filename  = os.path.basename(filepath)
     peer_name = config.peer_hostname or config.peer_ip or "peer"
 
     click.echo(f"\nSharing: {filename}")
@@ -70,13 +97,13 @@ def _share_plain(filepath, caption, config, network, git_engine):
     if network and network.is_peer_reachable():
         click.echo(f"→ {peer_name} is online — sending via LAN...")
     else:
-        click.echo(f"⚠  {peer_name} is offline — will queue for later")
+        click.echo(f"⚠  {peer_name} is offline — will queue in Supabase Storage")
 
     def on_progress(msg):
         icon = "✓" if "✓" in msg else ("⚠" if "⚠" in msg else "→")
         click.echo(f"  {icon} {msg}")
 
-    sm = ShareManager(config, network, git_engine)
+    sm     = ShareManager(config, network, db=db)
     result = sm.share(filepath, caption=caption, on_progress=on_progress)
 
     if result.queued:
@@ -87,39 +114,35 @@ def _share_plain(filepath, caption, config, network, git_engine):
         click.echo(f"\n\033[91m✗ {result.message}\033[0m\n")
 
 
-def _queue_plain(config, network, git_engine):
-    from core.sharing import QueueManager, ShareManager
+def _queue_plain(config, network, db, pending):
+    """Plain terminal queue review — download files from Supabase Storage."""
+    from core.sharing import ShareManager
 
-    qm    = QueueManager()
-    sm    = ShareManager(config, network, git_engine)
-    items = qm.get_pending()
+    sm = ShareManager(config, network, db=db)
 
-    click.echo(f"\n{len(items)} file(s) queued:\n")
+    click.echo(f"\n{len(pending)} file(s) in cloud queue:\n")
 
-    for item in items:
-        click.echo(f" {item.filename}  ({item.size_display()})")
-        if item.caption:
-            click.echo(f"      \"{item.caption}\"")
-        click.echo(f"      Queued: {item.queued_at[:16]}\n")
+    for item in pending:
+        fname   = item.get("filename", "unknown")
+        mb      = item.get("file_size", 0) / 1_000_000
+        caption = item.get("caption", "")
+        ts      = item.get("queued_at", "")[:16]
 
-        send = click.confirm(f"  Send {item.filename} now?", default=True)
+        click.echo(f"  • {fname}  ({mb:.1f} MB)")
+        if caption:
+            click.echo(f'    "{caption}"')
+        click.echo(f"    Queued: {ts}\n")
 
-        if send:
+        download = click.confirm(f"  Download {fname}?", default=True)
+
+        if download:
             def on_progress(msg):
                 click.echo(f"  → {msg}")
 
-            result = sm._share_via_lan(
-                filepath=item.cached_path,
-                filename=item.filename,
-                file_size=item.file_size,
-                subfolder=item.destination_subfolder,
-                caption=item.caption,
-                on_progress=on_progress
-            )
+            result = sm.download_from_cloud(item, on_progress=on_progress)
 
             if result.success:
-                qm.remove(item.queue_id)
-                click.echo(f"  \033[92m✓ Sent {item.filename}\033[0m\n")
+                click.echo(f"  \033[92m✓ Downloaded {fname}\033[0m\n")
             else:
                 click.echo(f"  \033[91m✗ Failed: {result.message}\033[0m\n")
         else:
@@ -127,8 +150,12 @@ def _queue_plain(config, network, git_engine):
 
 
 def _show_queue_list(items):
+    """Utility: print a simple list of queue items (no interaction)."""
     for item in items:
-        click.echo(f"  • {item.filename}  {item.size_display()}  — {item.queued_at[:16]}")
-        if item.caption:
-            click.echo(f'    Caption: "{item.caption}"')
+        mb      = item.get("file_size", 0) / 1_000_000
+        caption = item.get("caption", "")
+        ts      = item.get("queued_at", "")[:16]
+        click.echo(f"  • {item.get('filename', '?')}  {mb:.1f} MB  — {ts}")
+        if caption:
+            click.echo(f'    Caption: "{caption}"')
     click.echo()

@@ -1,420 +1,352 @@
-import json
 import os
-import shutil
-import time
-from dataclasses import dataclass, asdict, field
-from datetime import datetime
+import io
+import uuid
+import socket
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Callable
+from typing import Callable, Optional
+
+import boto3
+import zstandard as zstd
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+
+load_dotenv()
+
+NEXSYNC_DIR      = Path.home() / ".nexsync"
+FERNET_KEY       = NEXSYNC_DIR / "transfer.key"
+SIZE_BLOCK_MB    = 2048
+STORAGE_WARN_GB  = 6    # warn user above this
+STORAGE_LIMIT_GB = 10   # B2 free tier
 
 
-QUEUE_DIR        = Path.home() / ".nexsync" / "queue"
-QUEUE_FILE       = QUEUE_DIR / "queue.json"
-SHARED_IMAGES    = "shared/images"
-SHARED_FILES     = "shared/files"
-
-SIZE_WARN_MB     = 50     # warn user above this
-SIZE_BLOCK_MB    = 2048   # hard block above 2GB
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp", ".tiff", ".svg"}
-
-
-@dataclass
-class QueuedFile:
-    """A file waiting to be sent when LAN is available."""
-    queue_id: str                    # unique ID for this queued item
-    original_path: str               # where the file was on disk when queued
-    cached_path: str                 # where we stored a copy in ~/.nexsync/queue/
-    filename: str                    # just the name e.g. "photo.jpg"
-    caption: str                     # optional message
-    sender_hostname: str             # this machine's name
-    file_size: int                   # bytes
-    queued_at: str                   # ISO timestamp
-    destination_subfolder: str       # "shared/images" or "shared/files"
-    confirmed: bool = False          # has user confirmed sending?
-
-    def size_display(self) -> str:
-        """Human readable file size."""
-        mb = self.file_size / 1_000_000
-        if mb < 1:
-            return f"{self.file_size / 1000:.1f} KB"
-        return f"{mb:.1f} MB"
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "QueuedFile":
-        return cls(**d)
+def _get_or_create_key() -> bytes:
+    NEXSYNC_DIR.mkdir(parents=True, exist_ok=True)
+    if FERNET_KEY.exists():
+        return FERNET_KEY.read_bytes()
+    key = Fernet.generate_key()
+    FERNET_KEY.write_bytes(key)
+    FERNET_KEY.chmod(0o600)
+    return key
 
 
 @dataclass
 class ShareResult:
-    success: bool
-    message: str
-    queued: bool = False             # True if added to queue instead of sent
-    filename: str = ""
-    placeholder_path: str = ""
+    success:      bool
+    message:      str
+    queued:       bool = False
+    filename:     str  = ""
+    storage_path: str  = ""
 
-class QueueManager:
-
-
-    def __init__(self):
-        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-        self._queue: List[QueuedFile] = []
-        self._load()
-
-    def _load(self):
-        if QUEUE_FILE.exists():
-            try:
-                data = json.loads(QUEUE_FILE.read_text())
-                self._queue = [QueuedFile.from_dict(item) for item in data]
-            except (json.JSONDecodeError, TypeError):
-                self._queue = []
-        else:
-            self._queue = []
-
-    def _save(self):
-        QUEUE_FILE.write_text(
-            json.dumps([item.to_dict() for item in self._queue], indent=2)
-        )
-
-    def add(self, queued_file: QueuedFile):
-        """Add a file to the queue."""
-        self._queue.append(queued_file)
-        self._save()
-
-    def get_all(self) -> List[QueuedFile]:
-        return list(self._queue)
-
-    def get_pending(self) -> List[QueuedFile]:
-        return [f for f in self._queue if not f.confirmed]
-
-    def confirm(self, queue_id: str):
-        for item in self._queue:
-            if item.queue_id == queue_id:
-                item.confirmed = True
-        self._save()
-
-    def confirm_all(self):
-        for item in self._queue:
-            item.confirmed = True
-        self._save()
-
-    def remove(self, queue_id: str):
-        item = next((f for f in self._queue if f.queue_id == queue_id), None)
-        if item:
-            # Delete cached copy
-            cached = Path(item.cached_path)
-            if cached.exists():
-                cached.unlink()
-            self._queue = [f for f in self._queue if f.queue_id != queue_id]
-            self._save()
-
-    def clear_confirmed(self):
-        for item in self._queue:
-            if item.confirmed:
-                cached = Path(item.cached_path)
-                if cached.exists():
-                    cached.unlink()
-        self._queue = [f for f in self._queue if not f.confirmed]
-        self._save()
-
-    def count(self) -> int:
-        return len(self._queue)
-
-    def is_empty(self) -> bool:
-        return len(self._queue) == 0
 
 class ShareManager:
-    def __init__(self, config, network, git_engine):
-        self.config = config
+    def __init__(self, config, network, db=None):
+        self.config  = config
         self.network = network
-        self.git_engine = git_engine
-        self.queue = QueueManager()
-    def share(
-        self,
-        filepath: str,
-        caption: str = "",
-        on_progress: Callable[[str], None] = None
-    ) -> ShareResult:
+        self.db      = db
+        self._fernet = Fernet(_get_or_create_key())
+        self._b2     = self._init_b2()
 
-        filepath = os.path.expanduser(filepath)
+    def _init_b2(self):
+        try:
+            # .env takes priority over config.json
+            endpoint = os.getenv("B2_ENDPOINT")
+            key_id   = os.getenv("B2_KEY_ID")
+            app_key  = os.getenv("B2_APP_KEY")
 
+            if not all([endpoint, key_id, app_key]):
+                cfg_path = NEXSYNC_DIR / "config.json"
+                if cfg_path.exists():
+                    cfg      = json.loads(cfg_path.read_text())
+                    endpoint = endpoint or cfg.get("b2_endpoint")
+                    key_id   = key_id   or cfg.get("b2_key_id")
+                    app_key  = app_key  or cfg.get("b2_app_key")
+
+            if not all([endpoint, key_id, app_key]):
+                return None
+
+            return boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=app_key,
+            )
+        except Exception as e:
+            print(f"[Sharing] B2 init failed: {e}")
+            return None
+
+    def _bucket(self) -> str:
+        bucket = os.getenv("B2_BUCKET")
+        if bucket:
+            return bucket
+        try:
+            cfg = json.loads((NEXSYNC_DIR / "config.json").read_text())
+            return cfg.get("b2_bucket", "nexsync-transfers")
+        except Exception:
+            return "nexsync-transfers"
+
+    def get_b2_usage(self) -> dict:
+        """Returns total bytes / GB currently stored in B2 bucket."""
+        if not self._b2:
+            return {"bytes": 0, "gb": 0.0, "files": 0}
+        try:
+            paginator   = self._b2.get_paginator("list_objects_v2")
+            total_bytes = 0
+            total_files = 0
+            for page in paginator.paginate(Bucket=self._bucket()):
+                for obj in page.get("Contents", []):
+                    total_bytes += obj["Size"]
+                    total_files += 1
+            return {
+                "bytes": total_bytes,
+                "gb":    round(total_bytes / 1_000_000_000, 3),
+                "files": total_files
+            }
+        except Exception as e:
+            return {"bytes": 0, "gb": 0.0, "files": 0, "error": str(e)}
+
+    def _check_storage(self, on_progress: Callable = None) -> bool:
+        usage = self.get_b2_usage()
+        gb    = usage["gb"]
+
+        if gb >= STORAGE_LIMIT_GB:
+            msg = (
+                f"B2 storage full ({gb:.1f} GB / {STORAGE_LIMIT_GB} GB).\n"
+                f"   Cannot upload until space is freed.\n"
+                f"   Run: nexsync cloud clear"
+            )
+            on_progress and on_progress(msg)
+            print(f"[Sharing] {msg}")
+            return False
+
+        if gb >= STORAGE_WARN_GB:
+            msg = (
+                f"⚠  B2 storage at {gb:.1f} GB / {STORAGE_LIMIT_GB} GB "
+                f"({int(gb / STORAGE_LIMIT_GB * 100)}% used). "
+                f"Consider clearing synced files: nexsync cloud clear"
+            )
+            on_progress and on_progress(msg)
+            print(f"[Sharing] {msg}")
+
+        return True
+
+    # Smart share 
+
+    def share(self, filepath: str, caption: str = "", on_progress: Callable = None) -> ShareResult:
+        filepath  = os.path.expanduser(filepath)
         if not os.path.exists(filepath):
             return ShareResult(False, f"File not found: {filepath}")
 
-        filename   = os.path.basename(filepath)
-        file_size  = os.path.getsize(filepath)
-        size_mb    = file_size / 1_000_000
+        file_size = os.path.getsize(filepath)
+        size_mb   = file_size / 1_000_000
 
         if size_mb > SIZE_BLOCK_MB:
-            return ShareResult(
-                False,
-                f"File too large ({size_mb:.0f} MB). "
-                f"NexSync supports up to {SIZE_BLOCK_MB} MB."
-            )
+            return ShareResult(False, f"File too large ({size_mb:.0f} MB). Max is {SIZE_BLOCK_MB} MB.")
 
-        ext = Path(filepath).suffix.lower()
-        subfolder = SHARED_IMAGES if ext in IMAGE_EXTENSIONS else SHARED_FILES
-
+        filename = os.path.basename(filepath)
         on_progress and on_progress(f"Preparing {filename} ({size_mb:.1f} MB)...")
 
         if self.network.is_peer_reachable():
-            return self._share_via_lan(
-                filepath, filename, file_size, subfolder, caption, on_progress
-            )
-        else:
-            return self._queue_for_later(
-                filepath, filename, file_size, subfolder, caption, on_progress
-            )
+            return self._share_via_lan(filepath, filename, on_progress)
+        return self.queue_for_cloud(filepath, caption=caption, on_progress=on_progress)
 
-    def _share_via_lan(
-        self,
-        filepath: str,
-        filename: str,
-        file_size: int,
-        subfolder: str,
-        caption: str,
-        on_progress: Callable
-    ) -> ShareResult:
+    # LAN path 
 
-        on_progress and on_progress(f"Peer is online — sending via LAN...")
+    def _share_via_lan(self, filepath, filename, on_progress) -> ShareResult:
+        on_progress and on_progress("Peer online — sending via LAN...")
+        remote_sync = self.config.peer_sync_folder
+        remote_dest = f"{remote_sync}/{filename}".replace("\\", "/")
+        self.network.run_remote_command(f'mkdir -p "{remote_sync}"')
 
-        local_sync   = self.config.sync_folder
-        remote_sync  = self.config.peer_sync_folder
-        remote_dest  = f"{remote_sync}/{subfolder}/{filename}".replace("\\", "/")
+        if not self._sftp_put(filepath, remote_dest, on_progress):
+            return ShareResult(False, "SSH transfer failed.")
 
-        self.network.run_remote_command(
-            f'mkdir -p "{remote_sync}/{subfolder}"'
-        )
+        on_progress and on_progress(f"✓ Sent {filename} via LAN")
+        if self.db:
+            self.db.log_sync_event("share_lan", filename)
+        return ShareResult(True, f"Sent {filename} via LAN", filename=filename)
 
-        result = self._sftp_single_file(filepath, remote_dest, on_progress)
-        if not result:
-            return ShareResult(False, "SSH transfer failed. Check connection.")
+    # Cloud path: upload 
 
-        on_progress and on_progress(f"✓ File sent via SSH")
-
-        local_dest_dir = Path(local_sync) / subfolder
-        local_dest_dir.mkdir(parents=True, exist_ok=True)
-        local_dest = local_dest_dir / filename
-        if str(filepath) != str(local_dest):
-            shutil.copy2(filepath, local_dest)
-
-        placeholder_path = self._write_placeholder(
-            local_sync, subfolder, filename, file_size, caption
-        )
-
-        self._add_to_gitignore(local_sync, subfolder, filename)
-        self.git_engine.commit_changes(
-            message=f"share: {filename} from {self._hostname()}"
-        )
-
-        on_progress and on_progress(f"✓ Placeholder committed to git")
-
-        return ShareResult(
-            success=True,
-            message=f"Sent {filename} directly to peer via LAN",
-            queued=False,
-            filename=filename,
-            placeholder_path=placeholder_path
-        )
-
-    def _queue_for_later(
-        self,
-        filepath: str,
-        filename: str,
-        file_size: int,
-        subfolder: str,
-        caption: str,
-        on_progress: Callable
-    ) -> ShareResult:
-
-        import uuid
-        queue_id    = str(uuid.uuid4())[:8]
-        cached_path = QUEUE_DIR / f"{queue_id}_{filename}"
-
-        shutil.copy2(filepath, cached_path)
-
-        queued = QueuedFile(
-            queue_id=queue_id,
-            original_path=filepath,
-            cached_path=str(cached_path),
-            filename=filename,
-            caption=caption,
-            sender_hostname=self._hostname(),
-            file_size=file_size,
-            queued_at=datetime.now().isoformat(),
-            destination_subfolder=subfolder
-        )
-
-        self.queue.add(queued)
-
-        size_display = queued.size_display()
-
-        return ShareResult(
-            success=True,
-            message=(
-                f"  Peer not reachable.\n"
-                f"   {filename} ({size_display}) has been queued.\n"
-                f"   You'll be asked to confirm when your peer is back on the same WiFi."
-            ),
-            queued=True,
-            filename=filename
-        )
-
-
-    def process_queue(
-        self,
-        on_confirm: Callable[[QueuedFile], bool],
-        on_progress: Callable[[str], None] = None
-    ) -> dict:
-
-        if self.queue.is_empty():
-            return {"sent": 0, "skipped": 0, "failed": 0}
-
-        pending = self.queue.get_pending()
-        if not pending:
-            return {"sent": 0, "skipped": 0, "failed": 0}
-
-        sent = skipped = failed = 0
-
-        for item in pending:
-            should_send = on_confirm(item)
-
-            if not should_send:
-                skipped += 1
-                on_progress and on_progress(f"Skipped: {item.filename}")
-                continue
-
-            if not Path(item.cached_path).exists():
-                on_progress and on_progress(f"✗ Cached file missing: {item.filename}")
-                self.queue.remove(item.queue_id)
-                failed += 1
-                continue
-
-            on_progress and on_progress(f"Sending {item.filename}...")
-            result = self._share_via_lan(
-                filepath=item.cached_path,
-                filename=item.filename,
-                file_size=item.file_size,
-                subfolder=item.destination_subfolder,
-                caption=item.caption,
-                on_progress=on_progress
+    def queue_for_cloud(self, filepath: str, caption: str = "", on_progress: Callable = None) -> ShareResult:
+        if not self._b2:
+            return ShareResult(
+                False,
+                "Backblaze B2 not configured.\n"
+                "Add b2_endpoint, b2_key_id, b2_app_key, b2_bucket to ~/.nexsync/config.json"
             )
 
-            if result.success:
-                self.queue.remove(item.queue_id)
-                sent += 1
-                on_progress and on_progress(f"✓ Sent: {item.filename}")
-            else:
-                failed += 1
-                on_progress and on_progress(f"✗ Failed: {item.filename} — {result.message}")
+        filepath  = os.path.expanduser(filepath)
+        if not os.path.exists(filepath):
+            return ShareResult(False, f"File not found: {filepath}")
 
-        return {"sent": sent, "skipped": skipped, "failed": failed}
+        filename  = os.path.basename(filepath)
+        file_size = os.path.getsize(filepath)
+        size_mb   = file_size / 1_000_000
 
-    def check_and_prompt_queue(self, on_progress: Callable = None) -> bool:
-        if self.queue.is_empty():
-            return False
+        if size_mb > SIZE_BLOCK_MB:
+            return ShareResult(False, f"{filename} is {size_mb:.0f} MB — over the 2GB limit.")
 
-        count = self.queue.count()
-        items = self.queue.get_pending()
-        total_size = sum(f.file_size for f in items)
-        size_mb = total_size / 1_000_000
+        if not self._check_storage(on_progress):
+            return ShareResult(False, "B2 storage full. Run: nexsync cloud clear")
 
-        on_progress and on_progress(
-            f"\n⚠  You have {count} queued file(s) ({size_mb:.1f} MB total) "
-            f"waiting to send to {self.config.peer_hostname}.\n"
-            f"   Run 'nexsync queue' to review and send them."
-        )
-        return True
+        on_progress and on_progress(f"Compressing {filename}...")
 
-    def _write_placeholder(
-        self,
-        sync_folder: str,
-        subfolder: str,
-        filename: str,
-        file_size: int,
-        caption: str
-    ) -> str:
+        try:
+            with open(filepath, "rb") as f:
+                raw = f.read()
 
-        dest_dir = Path(sync_folder) / subfolder
-        dest_dir.mkdir(parents=True, exist_ok=True)
+            compressed = zstd.ZstdCompressor(level=3).compress(raw)
+            encrypted  = self._fernet.encrypt(compressed)
 
-        placeholder_path = dest_dir / f"{filename}.placeholder"
+            on_progress and on_progress(f"Uploading to Backblaze B2...")
+            storage_path = self._b2_upload(filename, encrypted, on_progress)
 
-        placeholder_path.write_text(filename)
+            if not self.db:
+                return ShareResult(False, "Database not configured.")
 
-        return str(placeholder_path)
+            peer = self.db.get_paired_device()
+            if not peer:
+                return ShareResult(False, "No paired device found.")
 
-    def _add_to_gitignore(self, sync_folder: str, subfolder: str, filename: str):
+            self.db.client.table("queue").insert({
+                "sender_id":    self.db._device_id or self._get_sender_id(),
+                "receiver_id":  peer["id"],
+                "filename":     filename,
+                "file_size":    file_size,
+                "file_hash":    self._sha256(raw),
+                "caption":      caption,
+                "storage_path": storage_path,
+                "status":       "pending",
+                "queued_at":    datetime.now(timezone.utc).isoformat(),
+            }).execute()
 
-        gitignore = Path(sync_folder) / ".gitignore"
+            on_progress and on_progress(f"✓ {filename} uploaded — peer will be notified")
+            if self.db:
+                self.db.log_sync_event("queue_cloud", filename)
 
-        existing = gitignore.read_text() if gitignore.exists() else ""
+            return ShareResult(
+                True,
+                f"{filename} uploaded to B2. Peer will receive it when online.",
+                queued=True, filename=filename, storage_path=storage_path
+            )
 
-        pattern = f"{subfolder}/{filename}"
-        if pattern not in existing:
-            with open(gitignore, "a") as f:
-                f.write(f"\n# NexSync shared file (transferred via SSH)\n{pattern}\n")
+        except Exception as e:
+            return ShareResult(False, f"Cloud upload failed: {e}")
 
-    def _sftp_single_file(
-        self,
-        local_path: str,
-        remote_path: str,
-        on_progress: Callable = None
-    ) -> bool:
-        """Transfer a single file over SFTP."""
+    def _b2_upload(self, filename: str, data: bytes, on_progress: Callable = None) -> str:
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uid = str(uuid.uuid4())[:8]
+        key = f"{ts}_{uid}_{filename}.enc"
+
+        uploaded = [0]
+        total    = len(data)
+
+        def _cb(n):
+            uploaded[0] += n
+            if on_progress and total > 0:
+                pct = int(uploaded[0] / total * 100)
+                on_progress(f"  {pct}% ({uploaded[0] / 1_000_000:.1f} MB)")
+
+        self._b2.upload_fileobj(io.BytesIO(data), self._bucket(), key, Callback=_cb)
+        return key
+
+    # Cloud path: download 
+
+    def download_from_cloud(self, queue_item: dict, on_progress: Callable = None) -> ShareResult:
+        if not self._b2:
+            return ShareResult(False, "Backblaze B2 not configured.")
+
+        filename      = queue_item.get("filename", "unknown")
+        storage_path  = queue_item.get("storage_path")
+        queue_id      = queue_item.get("id")
+        expected_hash = queue_item.get("file_hash")
+
+        if not storage_path:
+            return ShareResult(False, f"No storage path for {filename}")
+
+        on_progress and on_progress(f"Downloading {filename} from B2...")
+
+        try:
+            buf = io.BytesIO()
+            self._b2.download_fileobj(self._bucket(), storage_path, buf)
+
+            on_progress and on_progress("Decrypting...")
+            compressed = self._fernet.decrypt(buf.getvalue())
+            raw        = zstd.ZstdDecompressor().decompress(compressed)
+
+            if expected_hash and self._sha256(raw) != expected_hash:
+                return ShareResult(False, f"Hash mismatch — {filename} may be corrupted")
+
+            sync_folder = self.config.sync_folder
+            if not sync_folder:
+                return ShareResult(False, "Sync folder not configured.")
+
+            dest = Path(sync_folder) / filename
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(raw)
+
+            on_progress and on_progress(f"✓ {filename} saved")
+
+            if queue_id and self.db:
+                self.db.update_queue_status(queue_id, "sent")
+
+            self._b2_delete(storage_path)
+
+            if self.db:
+                self.db.log_sync_event("download_cloud", filename)
+
+            return ShareResult(True, f"Received {filename}", filename=filename)
+
+        except Exception as e:
+            return ShareResult(False, f"Download failed: {e}")
+
+    def _b2_delete(self, key: str):
+        try:
+            self._b2.delete_object(Bucket=self._bucket(), Key=key)
+        except Exception as e:
+            print(f"[Sharing] Could not delete {key} from B2: {e}")
+
+    # SSH/SFTP 
+
+    def _sftp_put(self, local_path, remote_path, on_progress=None) -> bool:
         try:
             import paramiko
-
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client.connect(
                 hostname=self.config.peer_ip,
-                port=self.config.get("peer_port", 22),
+                port=getattr(self.config, "peer_port", 22),
                 username=self.config.peer_username,
-                key_filename=self.config.get("ssh_key_path") or None,
+                key_filename=getattr(self.config, "ssh_key_path", None) or None,
                 look_for_keys=True,
                 timeout=10
             )
-
             sftp = client.open_sftp()
-            file_size = os.path.getsize(local_path)
-            transferred = [0]
 
-            def _progress(sent, total):
-                transferred[0] = sent
+            def _cb(sent, total):
                 if on_progress and total > 0:
-                    pct = int(sent / total * 100)
-                    mb_sent = sent / 1_000_000
-                    on_progress(f"  Uploading... {pct}% ({mb_sent:.1f} MB)")
+                    on_progress(f"  {int(sent/total*100)}% ({sent/1_000_000:.1f} MB)")
 
-            sftp.put(local_path, remote_path, callback=_progress)
+            sftp.put(local_path, remote_path, callback=_cb)
             sftp.close()
             client.close()
             return True
-
         except Exception as e:
-            if on_progress:
-                on_progress(f"SSH error: {e}")
+            on_progress and on_progress(f"SSH error: {e}")
             return False
 
-    def _hostname(self) -> str:
-        import socket
-        return socket.gethostname()
+    # Helpers 
 
-    def get_queue_summary(self) -> str:
-        items = self.queue.get_all()
-        if not items:
-            return "Queue is empty."
+    def _get_sender_id(self) -> Optional[str]:
+        if not self.db:
+            return None
+        d = self.db.get_device()
+        return d["id"] if d else None
 
-        lines = [f"Queued files ({len(items)} total):\n"]
-        for item in items:
-            lines.append(
-                f"  • {item.filename}  {item.size_display()}  "
-                f"— queued at {item.queued_at[:16]}"
-            )
-            if item.caption:
-                lines.append(f"    Caption: \"{item.caption}\"")
-        return "\n".join(lines)
+    @staticmethod
+    def _sha256(data: bytes) -> str:
+        import hashlib
+        return hashlib.sha256(data).hexdigest()

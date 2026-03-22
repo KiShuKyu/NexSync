@@ -1,68 +1,48 @@
-"""
-NexSync Pairing System
-Discovers and pairs two machines on the same LAN.
-
-HOW IT WORKS:
-- Machine 1 (host): broadcasts "I am NexSync, hosted by @username" via UDP
-- Machine 2 (join): listens for that broadcast, verifies same GitHub account
-- Both exchange their local IPs and sync repo URL
-- Pairing info saved to config — never need to do this again
-
-WHY UDP BROADCAST:
-- No IP address needed — machine finds the other automatically
-- Same tech used by Chromecast, Spotify Connect, AirDrop
-- Works on all home/office routers without any configuration
-"""
-
 import json
 import socket
 import time
 import threading
 import uuid
+import platform
 from dataclasses import dataclass, asdict
 from typing import Optional, Callable
+from pathlib import Path
 
-# UDP broadcast settings
-BROADCAST_PORT    = 47123
-BROADCAST_ADDR    = "255.255.255.255"
-BROADCAST_INTERVAL = 2.0   # seconds between broadcasts
-DISCOVERY_TIMEOUT  = 30.0  # how long to search before giving up
+BROADCAST_PORT     = 47123
+BROADCAST_ADDR     = "255.255.255.255"
+BROADCAST_INTERVAL = 2.0
+DISCOVERY_TIMEOUT  = 30.0
 BUFFER_SIZE        = 4096
 
-# Message types
-MSG_ANNOUNCE  = "NEXSYNC_ANNOUNCE"   # "I'm here"
-MSG_RESPONSE  = "NEXSYNC_RESPONSE"   # "I see you, I'm here too"
-MSG_HANDSHAKE = "NEXSYNC_HANDSHAKE"  # "Let's exchange details"
-MSG_CONFIRM   = "NEXSYNC_CONFIRM"    # "Pairing confirmed ✓"
+MSG_ANNOUNCE  = "NEXSYNC_ANNOUNCE"
+MSG_RESPONSE  = "NEXSYNC_RESPONSE"
+MSG_HANDSHAKE = "NEXSYNC_HANDSHAKE"
 
 
 @dataclass
 class PeerInfo:
-    """All the info we know about a paired peer machine."""
-    username: str          # GitHub username (must match ours)
-    hostname: str          # Machine's hostname (e.g. "Zoro-PC")
-    local_ip: str          # Their LAN IP address
-    platform: str          # "windows" or "darwin" (mac)
-    sync_repo: str         # GitHub repo URL for relay
-    sync_folder: str       # Their sync folder path
-    peer_id: str           # Unique ID for this machine
-    paired_at: float       # Unix timestamp of when we paired
+    username:     str
+    hostname:     str
+    local_ip:     str
+    platform:     str
+    sync_folder:  str
+    peer_id:      str
+    paired_at:    float
+    device_uuid:  str = ""  # Supabase devices.id
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "PeerInfo":
-        return cls(**data)
+    def from_dict(cls, d: dict) -> "PeerInfo":
+        return cls(**d)
 
 
 class PairingError(Exception):
-    """Raised when pairing fails."""
     pass
 
 
-def get_local_ip() -> str:
-    """Get this machine's LAN IP address."""
+def _get_local_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -73,63 +53,114 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
-def get_machine_id() -> str:
-    """
-    Generate a stable unique ID for this machine.
-    Stored in config so it doesn't change between sessions.
-    """
-    id_file = __import__("pathlib").Path.home() / ".nexsync" / "machine_id"
+def _get_machine_id() -> str:
+    id_file = Path.home() / ".nexsync" / "machine_id"
     if id_file.exists():
         return id_file.read_text().strip()
-    machine_id = str(uuid.uuid4())
+    mid = str(uuid.uuid4())
     id_file.parent.mkdir(parents=True, exist_ok=True)
-    id_file.write_text(machine_id)
-    return machine_id
+    id_file.write_text(mid)
+    return mid
 
 
 class PairingManager:
-    """
-    Manages the discovery and pairing handshake between two NexSync machines.
 
-    Usage:
-        # On machine 1 (host):
-        pm = PairingManager(auth, config)
-        peer = pm.host(on_status=print)
-
-        # On machine 2 (join):
-        pm = PairingManager(auth, config)
-        peer = pm.join(on_status=print)
-    """
-
-    def __init__(self, auth, config):
-        self.auth = auth
-        self.config = config
-        self._machine_id = get_machine_id()
-        self._local_ip = get_local_ip()
+    def __init__(self, auth, config, db=None):
+        self.auth       = auth
+        self.config     = config
+        self.db         = db
+        self._machine_id = _get_machine_id()
+        self._local_ip   = _get_local_ip()
         self._stop_event = threading.Event()
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # Primary: Supabase pairing
+
+    def pair_via_supabase(self, on_status: Callable[[str], None] = None) -> PeerInfo:
+        if not self.db:
+            raise PairingError("Database not available. Use UDP pairing instead.")
+
+        on_status and on_status("Looking for other devices on your account...")
+
+        devices = self.db.get_online_devices()
+
+        if not devices:
+            # Also check offline devices — maybe the other machine isn't running yet
+            try:
+                user_id    = self.db.get_user_id()
+                machine_id = _get_machine_id()
+                res = (
+                    self.db.client.table("devices")
+                    .select("*")
+                    .eq("user_id", user_id)
+                    .neq("machine_id", machine_id)
+                    .execute()
+                )
+                devices = res.data or []
+            except Exception:
+                devices = []
+
+        if not devices:
+            raise PairingError(
+                "No other devices found on your account.\n"
+                "Make sure the other machine has run 'nexsync start' at least once."
+            )
+
+        if len(devices) == 1:
+            other = devices[0]
+        else:
+            # Multiple devices — let user pick
+            on_status and on_status(f"Found {len(devices)} device(s):")
+            for i, d in enumerate(devices):
+                on_status and on_status(f"  {i+1}. {d['hostname']} ({d['platform']}) — {d['local_ip']}")
+            # Default to first if no interactive context
+            other = devices[0]
+
+        on_status and on_status(f"Pairing with {other['hostname']}...")
+
+        # Create pair record in Supabase
+        try:
+            self.db.create_pair(other["id"])
+        except Exception as e:
+            # Pair may already exist — not fatal
+            on_status and on_status(f"Note: {e}")
+
+        # Save peer info to local config
+        self._save_peer_config(
+            ip=other.get("local_ip", ""),
+            hostname=other.get("hostname", ""),
+            sync_folder=other.get("sync_folder", ""),
+            machine_id=other.get("machine_id", ""),
+        )
+
+        on_status and on_status(f"✓ Paired with {other['hostname']}")
+
+        return PeerInfo(
+            username=other.get("user_id", ""),
+            hostname=other.get("hostname", "unknown"),
+            local_ip=other.get("local_ip", ""),
+            platform=other.get("platform", "unknown"),
+            sync_folder=other.get("sync_folder", ""),
+            peer_id=other.get("machine_id", ""),
+            paired_at=time.time(),
+            device_uuid=other.get("id", ""),
+        )
+
+    # Fallback: UDP broadcast (LAN only) 
 
     def host(self, on_status: Callable[[str], None] = None) -> PeerInfo:
-        """
-        HOST mode: broadcast presence, wait for another machine to join.
-        Blocks until a peer is found and paired, or times out.
-        """
+        """Broadcast on LAN, wait for another machine to join."""
         self._stop_event.clear()
         on_status and on_status(f"Broadcasting on LAN ({self._local_ip})...")
-        on_status and on_status("Waiting for another NexSync machine to join...")
 
-        found_peer: list = []  # use list so inner functions can write to it
+        found_peer: list = []
 
-        # Start broadcasting in background thread
-        broadcast_thread = threading.Thread(
+        t = threading.Thread(
             target=self._broadcast_loop,
             args=(found_peer, on_status),
             daemon=True
         )
-        broadcast_thread.start()
+        t.start()
 
-        # Wait for peer to be found
         deadline = time.time() + DISCOVERY_TIMEOUT
         while time.time() < deadline and not found_peer:
             time.sleep(0.5)
@@ -139,36 +170,37 @@ class PairingManager:
         if not found_peer:
             raise PairingError(
                 f"No NexSync machine found after {int(DISCOVERY_TIMEOUT)}s.\n"
-                "Make sure the other machine is running 'nexsync pair --join'."
+                "Try 'nexsync pair supabase' which works through firewalls."
             )
 
         peer = found_peer[0]
-        self.config.set("peer_ip", peer.local_ip)
-        self.config.set("peer_username", peer.username)
-        self.config.set("peer_sync_folder", peer.sync_folder)
-        self.config.set("peer_id", peer.peer_id)
-        self.config.set("peer_hostname", peer.hostname)
-        self.config.mark_initialized()
+        self._save_peer_config(peer.local_ip, peer.hostname, peer.sync_folder, peer.peer_id)
 
-        on_status and on_status(f"✓ Paired with {peer.hostname} (@{peer.username})")
+        # Also create Supabase pair record if db available
+        if self.db:
+            try:
+                other = self.db.get_device(peer.peer_id)
+                if other:
+                    self.db.create_pair(other["id"])
+            except Exception:
+                pass
+
+        on_status and on_status(f"✓ Paired with {peer.hostname}")
         return peer
 
     def join(self, on_status: Callable[[str], None] = None) -> PeerInfo:
-        """
-        JOIN mode: listen for a host broadcasting, respond to it.
-        Blocks until paired or times out.
-        """
+        """Listen for a host broadcasting on LAN."""
         self._stop_event.clear()
-        on_status and on_status(f"Listening for NexSync host on LAN ({self._local_ip})...")
+        on_status and on_status(f"Listening for NexSync host ({self._local_ip})...")
 
         found_peer: list = []
 
-        listen_thread = threading.Thread(
+        t = threading.Thread(
             target=self._listen_loop,
             args=(found_peer, on_status),
             daemon=True
         )
-        listen_thread.start()
+        t.start()
 
         deadline = time.time() + DISCOVERY_TIMEOUT
         while time.time() < deadline and not found_peer:
@@ -179,196 +211,131 @@ class PairingManager:
         if not found_peer:
             raise PairingError(
                 f"No NexSync host found after {int(DISCOVERY_TIMEOUT)}s.\n"
-                "Make sure the other machine is running 'nexsync pair --host'."
+                "Try 'nexsync pair supabase' which works through firewalls."
             )
 
         peer = found_peer[0]
-        self.config.set("peer_ip", peer.local_ip)
-        self.config.set("peer_username", peer.username)
-        self.config.set("peer_sync_folder", peer.sync_folder)
-        self.config.set("peer_id", peer.peer_id)
-        self.config.set("peer_hostname", peer.hostname)
-        self.config.mark_initialized()
+        self._save_peer_config(peer.local_ip, peer.hostname, peer.sync_folder, peer.peer_id)
 
-        on_status and on_status(f"✓ Paired with {peer.hostname} (@{peer.username})")
+        if self.db:
+            try:
+                other = self.db.get_device(peer.peer_id)
+                if other:
+                    self.db.create_pair(other["id"])
+            except Exception:
+                pass
+
+        on_status and on_status(f"✓ Paired with {peer.hostname}")
         return peer
 
-    # ── Internal: Host (Broadcast) ────────────────────────────────────────────
+    # UDP internals 
 
     def _broadcast_loop(self, found_peer: list, on_status: Callable):
-        """Continuously broadcast our presence AND listen for responses."""
+        bcast = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        bcast.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        bcast.settimeout(0.5)
 
-        # Socket for broadcasting
-        broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        broadcast_sock.settimeout(0.5)
+        listen = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen.bind(("", BROADCAST_PORT + 1))
+        listen.settimeout(0.5)
 
-        # Socket for listening to responses
-        listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_sock.bind(("", BROADCAST_PORT + 1))  # host listens on +1 port
-        listen_sock.settimeout(0.5)
-
-        announce_msg = self._build_message(MSG_ANNOUNCE)
+        msg = json.dumps(self._build_msg(MSG_ANNOUNCE)).encode()
 
         try:
-            last_broadcast = 0
+            last_bcast = 0
             while not self._stop_event.is_set() and not found_peer:
+                if time.time() - last_bcast >= BROADCAST_INTERVAL:
+                    bcast.sendto(msg, (BROADCAST_ADDR, BROADCAST_PORT))
+                    last_bcast = time.time()
 
-                # Broadcast every BROADCAST_INTERVAL seconds
-                if time.time() - last_broadcast >= BROADCAST_INTERVAL:
-                    broadcast_sock.sendto(
-                        json.dumps(announce_msg).encode(),
-                        (BROADCAST_ADDR, BROADCAST_PORT)
-                    )
-                    last_broadcast = time.time()
-
-                # Check for responses
                 try:
-                    data, addr = listen_sock.recvfrom(BUFFER_SIZE)
-                    msg = json.loads(data.decode())
-
-                    if (msg.get("type") == MSG_RESPONSE and
-                            msg.get("machine_id") != self._machine_id):
-
-                        on_status and on_status(f"Found machine: {msg['hostname']} ({addr[0]})")
-
-                        # Verify same GitHub account
-                        if not self._verify_peer_identity(msg):
-                            on_status and on_status(
-                                f"Skipping {msg['hostname']} — different GitHub account"
-                            )
-                            continue
-
-                        # Send handshake
-                        handshake = self._build_message(MSG_HANDSHAKE)
-                        broadcast_sock.sendto(
-                            json.dumps(handshake).encode(),
-                            (addr[0], BROADCAST_PORT)
-                        )
-
-                        # Build peer info
-                        peer = self._build_peer_info(msg, addr[0])
-                        found_peer.append(peer)
-
-                except socket.timeout:
+                    data, addr = listen.recvfrom(BUFFER_SIZE)
+                    incoming = json.loads(data.decode())
+                    if (incoming.get("type") == MSG_RESPONSE
+                            and incoming.get("machine_id") != self._machine_id):
+                        on_status and on_status(f"Found: {incoming['hostname']} ({addr[0]})")
+                        handshake = json.dumps(self._build_msg(MSG_HANDSHAKE)).encode()
+                        bcast.sendto(handshake, (addr[0], BROADCAST_PORT))
+                        found_peer.append(self._make_peer(incoming, addr[0]))
+                except (socket.timeout, json.JSONDecodeError):
                     pass
-                except json.JSONDecodeError:
-                    pass
-
         finally:
-            broadcast_sock.close()
-            listen_sock.close()
-
-    # ── Internal: Join (Listen) ───────────────────────────────────────────────
+            bcast.close()
+            listen.close()
 
     def _listen_loop(self, found_peer: list, on_status: Callable):
-        """Listen for host broadcasts, respond when found."""
+        listen = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen.bind(("", BROADCAST_PORT))
+        listen.settimeout(0.5)
 
-        listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_sock.bind(("", BROADCAST_PORT))
-        listen_sock.settimeout(0.5)
-
-        response_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        response_sock.settimeout(3.0)
+        resp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        resp.settimeout(3.0)
 
         try:
             while not self._stop_event.is_set() and not found_peer:
                 try:
-                    data, addr = listen_sock.recvfrom(BUFFER_SIZE)
-                    msg = json.loads(data.decode())
-
-                    if (msg.get("type") == MSG_ANNOUNCE and
-                            msg.get("machine_id") != self._machine_id):
-
-                        on_status and on_status(f"Found host: {msg['hostname']} ({addr[0]})")
-
-                        # Verify same GitHub account
-                        if not self._verify_peer_identity(msg):
-                            on_status and on_status(
-                                f"Skipping {msg['hostname']} — different GitHub account"
-                            )
-                            continue
-
-                        # Send our response
-                        response = self._build_message(MSG_RESPONSE)
-                        response_sock.sendto(
-                            json.dumps(response).encode(),
-                            (addr[0], BROADCAST_PORT + 1)
-                        )
-
-                        # Wait for handshake confirmation
+                    data, addr = listen.recvfrom(BUFFER_SIZE)
+                    incoming = json.loads(data.decode())
+                    if (incoming.get("type") == MSG_ANNOUNCE
+                            and incoming.get("machine_id") != self._machine_id):
+                        on_status and on_status(f"Found host: {incoming['hostname']} ({addr[0]})")
+                        response = json.dumps(self._build_msg(MSG_RESPONSE)).encode()
+                        resp.sendto(response, (addr[0], BROADCAST_PORT + 1))
+                        # Wait for handshake
                         try:
-                            confirm_data, _ = listen_sock.recvfrom(BUFFER_SIZE)
+                            confirm_data, _ = listen.recvfrom(BUFFER_SIZE)
                             confirm = json.loads(confirm_data.decode())
                             if confirm.get("type") == MSG_HANDSHAKE:
-                                peer = self._build_peer_info(msg, addr[0])
-                                found_peer.append(peer)
+                                found_peer.append(self._make_peer(incoming, addr[0]))
                         except socket.timeout:
                             pass
-
-                except socket.timeout:
+                except (socket.timeout, json.JSONDecodeError):
                     pass
-                except json.JSONDecodeError:
-                    pass
-
         finally:
-            listen_sock.close()
-            response_sock.close()
+            listen.close()
+            resp.close()
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # Helpers 
 
-    def _build_message(self, msg_type: str) -> dict:
-        """Build a broadcast message packet."""
-        import platform
+    def _build_msg(self, msg_type: str) -> dict:
         return {
-            "type": msg_type,
-            "machine_id": self._machine_id,
-            "username": self._safe_get_username(),
-            "hostname": socket.gethostname(),
-            "local_ip": self._local_ip,
-            "platform": platform.system().lower(),   # "windows" or "darwin"
-            "sync_folder": self.config.sync_folder,
-            "sync_repo": self.config.get("sync_repo", ""),
-            "version": "1.0.0",
-            "timestamp": time.time()
+            "type":        msg_type,
+            "machine_id":  self._machine_id,
+            "hostname":    socket.gethostname(),
+            "local_ip":    self._local_ip,
+            "platform":    platform.system().lower(),
+            "sync_folder": self.config.sync_folder or "",
+            "version":     "2.0.0",
+            "timestamp":   time.time(),
         }
-    def _safe_get_username(self) -> str:
-        try:
-            return self.auth.get_email()
-        except Exception:
-            return "unknown"
 
-    def _verify_peer_identity(self, msg: dict) -> bool:
-        try:
-            our_identity = self.auth.get_email()
-            peer_identity = msg.get("username", "")
-            return our_identity == peer_identity and peer_identity != "unknown"
-        except Exception:
-            return False
-
-    def _build_peer_info(self, msg: dict, ip: str) -> PeerInfo:
-        """Build a PeerInfo object from a broadcast message."""
+    def _make_peer(self, msg: dict, ip: str) -> PeerInfo:
         return PeerInfo(
-            username=msg.get("username", ""),
+            username=msg.get("hostname", ""),
             hostname=msg.get("hostname", "unknown"),
             local_ip=ip,
             platform=msg.get("platform", "unknown"),
-            sync_repo=msg.get("sync_repo", ""),
             sync_folder=msg.get("sync_folder", ""),
             peer_id=msg.get("machine_id", ""),
-            paired_at=time.time()
+            paired_at=time.time(),
         )
 
+    def _save_peer_config(self, ip: str, hostname: str, sync_folder: str, machine_id: str):
+        self.config.set("peer_ip", ip)
+        self.config.set("peer_hostname", hostname)
+        self.config.set("peer_sync_folder", sync_folder)
+        self.config.set("peer_id", machine_id)
+        self.config.mark_initialized()
+
     def is_peer_online(self) -> bool:
-        """Quick check — is our paired peer currently reachable?"""
         peer_ip = self.config.peer_ip
         if not peer_ip:
             return False
         try:
-            sock = socket.create_connection((peer_ip, 22), timeout=2)
-            sock.close()
+            s = socket.create_connection((peer_ip, 22), timeout=2)
+            s.close()
             return True
         except (socket.timeout, ConnectionRefusedError, OSError):
             return False
