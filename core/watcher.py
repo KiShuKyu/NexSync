@@ -141,12 +141,13 @@ class FileWatcher:
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[Watcher] {len(changed_files)} changed, {len(deleted_files)} deleted at {timestamp}")
 
+        # Get peers – first try discovered (mDNS), then fallback to manual config
         peers = self.network.get_discovered_peers()
         if not peers:
             manual_ip = self.config.peer_ip
             if manual_ip:
-                hostname = self.config.peer_hostname or "peer"
-                peers = {manual_ip: hostname}
+                # Use IP as hostname (since peer_hostname may not exist)
+                peers = {manual_ip: manual_ip}
                 print(f"[Watcher] No mDNS peers, using configured peer: {manual_ip}")
             else:
                 print("[Watcher] No peers discovered and no manual peer configured.")
