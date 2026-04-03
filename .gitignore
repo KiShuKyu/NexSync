@@ -8,3 +8,5 @@ mnt
 .env
 new.py
 remove
+remove2
+setup.py

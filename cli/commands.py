@@ -1,11 +1,3 @@
-"""
-cli/commands.py — NexSync Phase 2
-
-Git engine REMOVED entirely.
-Status, push, pull, log, diff all use SHA256 checksums + Supabase.
-resolve command removed (no git = no git conflicts).
-"""
-
 import os
 import sys
 import time
@@ -14,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 
-# ── ANSI colors ───────────────────────────────────────────────────────────────
+# ANSI colors
 GREEN  = "\033[92m"
 RED    = "\033[91m"
 YELLOW = "\033[93m"
@@ -26,15 +18,14 @@ RESET  = "\033[0m"
 
 LOGO = f"""
 {CYAN}{BOLD}
-  ██████╗ ██████╗ ██╗██╗   ██╗███████╗███████╗██╗   ██╗███╗   ██╗ ██████╗
-  ██╔══██╗██╔══██╗██║██║   ██║██╔════╝██╔════╝╚██╗ ██╔╝████╗  ██║██╔════╝
-  ██║  ██║██████╔╝██║██║   ██║█████╗  ███████╗ ╚████╔╝ ██╔██╗ ██║██║
-  ██║  ██║██╔══██╗██║╚██╗ ██╔╝██╔══╝  ╚════██║  ╚██╔╝  ██║╚██╗██║██║
-  ██████╔╝██║  ██║██║ ╚████╔╝ ███████╗███████║   ██║   ██║ ╚████║╚██████╗
-  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝╚══════╝   ╚═╝   ╚═╝  ╚═══╝ ╚═════╝
+  _   _           _____
+ | \ | | _____  _/ ____|
+ |  \| |/ _ \ \/ /\__ \ 
+ | |\  |  __/>  < ___) |
+ |_| \_|\___/_/\_\____/ 
+                        
 {RESET}{DIM}  Peer-to-peer cross-platform file sync  v2.0.0{RESET}
 """
-
 
 def print_logo():
     click.echo(LOGO)
@@ -49,10 +40,6 @@ def dim(msg):     click.echo(f"{DIM}{msg}{RESET}")
 
 class CLI:
     def __init__(self, config, network=None, watcher=None, db=None):
-        """
-        git_engine parameter removed.
-        db (NexSyncDB) added — needed for log, queue, cloud commands.
-        """
         self.config  = config
         self.network = network
         self.watcher = watcher
@@ -72,12 +59,9 @@ class CLI:
         def cli():
             pass
 
-        # ─────────────────────────
         # INIT
-        # ─────────────────────────
         @cli.command()
         def init():
-            """Initialize NexSync on this machine."""
             print_logo()
             click.echo(f"{BOLD}Setting up NexSync{RESET}\n")
 
@@ -116,9 +100,7 @@ class CLI:
             info(f"Sync folder: {folder}")
             info("Run 'nexsync start' to begin syncing")
 
-        # ─────────────────────────
         # STATUS
-        # ─────────────────────────
         @cli.command()
         def status():
             """Show sync status, changed files, and cloud queue."""
@@ -180,15 +162,12 @@ class CLI:
 
             click.echo()
 
-        # ─────────────────────────
         # PUSH
-        # ─────────────────────────
         @cli.command()
         @click.option("--force", "-f", is_flag=True, help="Push even if nothing changed")
         def push(force):
-            """Push changed files to peer (LAN or cloud)."""
             from core.checksum import ChecksumStore
-            from core.sharing  import ShareManager
+            from remove2.sharing  import ShareManager
 
             if not config.sync_folder:
                 error("Not initialized. Run 'nexsync init' first.")
@@ -238,12 +217,9 @@ class CLI:
             else:
                 error(f"Push failed: {result.message}")
 
-        # ─────────────────────────
         # PULL
-        # ─────────────────────────
         @cli.command()
         def pull():
-            """Pull latest files from peer via LAN."""
             from core.checksum import ChecksumStore
 
             if not network:
@@ -269,19 +245,15 @@ class CLI:
             )
 
             if result.success:
-                # Update checksum snapshot after pull so watcher doesn't re-push
                 cs = ChecksumStore(config.sync_folder)
                 cs.update_snapshot()
                 success(f"Pull complete: {result.message}")
             else:
                 error(f"Pull failed: {result.message}")
 
-        # ─────────────────────────
         # DIFF
-        # ─────────────────────────
         @cli.command()
         def diff():
-            """Show files that have changed since last sync."""
             from core.checksum import ChecksumStore
 
             if not config.sync_folder:
@@ -308,13 +280,10 @@ class CLI:
 
             click.echo()
 
-        # ─────────────────────────
         # LOG
-        # ─────────────────────────
         @cli.command()
         @click.option("--limit", "-n", default=20, help="Number of entries to show")
         def log(limit):
-            """Show sync history from Supabase."""
             if not db:
                 error("Database not configured.")
                 return
@@ -341,14 +310,10 @@ class CLI:
                 )
             click.echo()
 
-        # ─────────────────────────
-        # CONFIG
-        # ─────────────────────────
         @cli.command()
         @click.option("--show", is_flag=True, help="Show current config")
         @click.option("--set", "set_key", nargs=2, metavar="KEY VALUE")
         def config_cmd(show, set_key):
-            """View or update NexSync configuration."""
             if show or not set_key:
                 click.echo(f"\n{BOLD}NexSync Config{RESET}")
                 click.echo(config.display())
@@ -359,13 +324,9 @@ class CLI:
 
         cli.add_command(config_cmd, name="config")
 
-        # ─────────────────────────
-        # DISCOVER
-        # ─────────────────────────
         @cli.command()
         @click.option("--timeout", default=5, help="Seconds to scan")
         def discover(timeout):
-            """Auto-discover NexSync peers on the local network."""
             if not network:
                 error("Not initialized.")
                 return
@@ -387,14 +348,11 @@ class CLI:
                 click.echo(f"\nFound {len(found)} peer(s).")
                 info("Run: nexsync config --set peer_ip <IP>")
 
-        # ─────────────────────────
         # CLOUD
-        # ─────────────────────────
         @cli.command()
         @click.argument("action", type=click.Choice(["push", "pull", "status", "clear"]))
         def cloud(action):
-            """Interact with Supabase Storage. Actions: push pull status clear"""
-            from core.sharing  import ShareManager
+            from remove2.sharing  import ShareManager
             from core.checksum import ChecksumStore
 
             if not db:
@@ -455,19 +413,17 @@ class CLI:
                             except Exception as e:
                                 error(f"Could not clear {item['filename']}: {e}")
 
-        # ─────────────────────────
         # DASHBOARD (optional)
-        # ─────────────────────────
-        @cli.command()
-        @click.option("--port", default=5050)
-        def dashboard(port):
-            """Start the web dashboard UI."""
-            info(f"Starting NexSync dashboard at http://localhost:{port}")
-            try:
-                from ui.dashboard import start_dashboard
-                start_dashboard(config, network, watcher, port=port)
-            except ImportError as e:
-                error(f"Could not start dashboard: {e}")
-                info("Run: pip install flask")
+        # @cli.command()
+        # @click.option("--port", default=5050)
+        # def dashboard(port):
+        #     """Start the web dashboard UI."""
+        #     info(f"Starting NexSync dashboard at http://localhost:{port}")
+        #     try:
+        #         from ui.dashboard import start_dashboard
+        #         start_dashboard(config, network, watcher, port=port)
+        #     except ImportError as e:
+        #         error(f"Could not start dashboard: {e}")
+        #         info("Run: pip install flask")
 
-        return cli
+        # return cli

@@ -19,7 +19,7 @@ def register_share_commands(cli, config, network, db=None):
             _share_plain(filepath, caption, config, network, db)
         else:
             try:
-                from ui.share_ui import run_share
+                from remove2.share_ui import run_share
                 run_share(filepath, config, network, db)
             except ImportError:
                 # Fallback to plain if TUI not available
@@ -28,7 +28,6 @@ def register_share_commands(cli, config, network, db=None):
     @cli.command()
     @click.option("--no-ui", is_flag=True, help="Skip TUI, use plain terminal output")
     def queue(no_ui):
-        """Review and download files waiting in Supabase Storage."""
         if not db:
             click.echo("\033[91m✗ Database not configured.\033[0m")
             return
@@ -49,14 +48,13 @@ def register_share_commands(cli, config, network, db=None):
             _queue_plain(config, network, db, pending)
         else:
             try:
-                from ui.share_ui import run_queue
+                from remove2.share_ui import run_queue
                 run_queue(config, network, db)
             except ImportError:
                 _queue_plain(config, network, db, pending)
 
     @cli.command(name="queue-status")
     def queue_status():
-        """Show a summary of files waiting in Supabase Storage."""
         if not db:
             click.echo("\033[91m✗ Database not configured.\033[0m")
             return
@@ -83,11 +81,10 @@ def register_share_commands(cli, config, network, db=None):
         click.echo()
 
 
-# ── Plain terminal implementations ───────────────────────────────────────────
+# Plain terminal implementations 
 
 def _share_plain(filepath, caption, config, network, db):
-    """Plain terminal share — no TUI dependency."""
-    from core.sharing import ShareManager
+    from remove2.sharing import ShareManager
 
     filename  = os.path.basename(filepath)
     peer_name = config.peer_hostname or config.peer_ip or "peer"
@@ -95,9 +92,9 @@ def _share_plain(filepath, caption, config, network, db):
     click.echo(f"\nSharing: {filename}")
 
     if network and network.is_peer_reachable():
-        click.echo(f"→ {peer_name} is online — sending via LAN...")
+        click.echo(f"{peer_name} is online — sending via LAN...")
     else:
-        click.echo(f"⚠  {peer_name} is offline — will queue in Supabase Storage")
+        click.echo(f"{peer_name} is offline — will queue in Supabase Storage")
 
     def on_progress(msg):
         icon = "✓" if "✓" in msg else ("⚠" if "⚠" in msg else "→")
@@ -115,8 +112,7 @@ def _share_plain(filepath, caption, config, network, db):
 
 
 def _queue_plain(config, network, db, pending):
-    """Plain terminal queue review — download files from Supabase Storage."""
-    from core.sharing import ShareManager
+    from remove2.sharing import ShareManager
 
     sm = ShareManager(config, network, db=db)
 
@@ -150,7 +146,6 @@ def _queue_plain(config, network, db, pending):
 
 
 def _show_queue_list(items):
-    """Utility: print a simple list of queue items (no interaction)."""
     for item in items:
         mb      = item.get("file_size", 0) / 1_000_000
         caption = item.get("caption", "")
