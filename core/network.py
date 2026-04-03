@@ -84,8 +84,16 @@ class NetworkManager:
             for cb in self._on_peer_found_callbacks:
                 cb(peer_ip, hostname)
 
+    def set_manual_peer(self, ip: str, hostname: str = None):
+        self._discovered_peers[ip] = hostname or ip
+        print(f"[Network] Manual peer added: {hostname or ip} @ {ip}")
+
     def remove_service(self, zeroconf, service_type, name):
         print(f"[Network] Peer left: {name}")
+
+    def update_service(self, zeroconf, service_type, name):
+        self.remove_service(zeroconf, service_type, name)
+        self.add_service(zeroconf, service_type, name)
 
     def get_discovered_peers(self) -> Dict[str, str]:
         return self._discovered_peers.copy()

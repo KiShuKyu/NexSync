@@ -143,11 +143,16 @@ class FileWatcher:
 
         peers = self.network.get_discovered_peers()
         if not peers:
-            print("[Watcher] No peers discovered – changes saved locally only.")
-
-            self._checksum.update_snapshot(changed_files + deleted_files)
-            self._set_status("watching")
-            return
+            manual_ip = self.config.peer_ip
+            if manual_ip:
+                hostname = self.config.peer_hostname or "peer"
+                peers = {manual_ip: hostname}
+                print(f"[Watcher] No mDNS peers, using configured peer: {manual_ip}")
+            else:
+                print("[Watcher] No peers discovered and no manual peer configured.")
+                self._checksum.update_snapshot(changed_files + deleted_files)
+                self._set_status("watching")
+                return
 
         for rel_path in changed_files:
             abs_path = os.path.join(self.folder_path, rel_path)
