@@ -360,10 +360,16 @@ class NetworkManager:
     def _sftp_makedirs(self, sftp, remote_dir: str):
         if not remote_dir or remote_dir == "/":
             return
+        remote_dir = remote_dir.replace("\\", "/")
+        if remote_dir.endswith(":/") or remote_dir.endswith(":"):
+            return
         try:
             sftp.stat(remote_dir)
         except FileNotFoundError:
-            self._sftp_makedirs(sftp, os.path.dirname(remote_dir))
+            parent = os.path.dirname(remote_dir)
+            if parent == remote_dir or not parent:
+                return
+            self._sftp_makedirs(sftp, parent)
             try:
                 sftp.mkdir(remote_dir)
             except Exception:
