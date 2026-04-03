@@ -1,152 +1,200 @@
-# NexSync 🔄
+# NexSync 
 
-> Git-powered cross-platform file sync between Windows and Mac — peer-to-peer, no cloud required for file transfer.
-
-Built by [KiShuKyu](https://github.com/KiShuKyu) · Python · Supabase · SSH · Textual TUI
-
----
-
-## What is NexSync?
-
-NexSync is like **Dropbox + Git** without storing your files in anyone's cloud.
-
-- **Same WiFi** → files sync automatically in the background via SSH
-- **Off network** → changes committed locally via git, synced when back online
-- **Cross-platform** → Windows ↔ Mac ↔ Linux
-- **Git-powered** → every sync is a commit, full history, conflict detection
-- **No file size limits** → SSH transfers directly between machines
-
-### What goes where
-
-| Data | Where |
-|---|---|
-| Your files | SSH transfer — machine to machine only |
-| Git history | Local on each machine |
-| Auth + pairing + queue | Supabase (metadata only, never file content) |
-| Images/binary files | SSH on LAN, Supabase Storage temporarily off-network |
+<div align="center">
+<br />
+  <p>
+  <strong>AirDrop‑like LAN file sync for Windows ↔ Mac — except this one doesn’t pretend other platforms don’t exist.</strong>
+  </p>
+        <p>
+        <img src="https://img.shields.io/badge/Python-3.9+-blue?logo=python" />
+        <img src="https://img.shields.io/badge/watchdog-3.0+-orange" />
+        <img src="https://img.shields.io/badge/paramiko-3.3+-brightgreen" />
+        <img src="https://img.shields.io/badge/zeroconf-0.115+-lightblue" />
+        <img src="https://img.shields.io/badge/click-8.1+-yellow" />
+        </p>
+</div>
 
 ---
 
-## Tech Stack
+##  TL;DR
 
-| Layer | Library | Purpose |
-|---|---|---|
-| File versioning | `gitpython` | Track changes, history, conflict detection |
-| File watching | `watchdog` | Detect changes in real time |
-| Transfer | `paramiko` | SSH/SFTP file transfer |
-| Discovery | `zeroconf` | Auto-find peers on LAN |
-| Auth + Pairing | `supabase` | Email/password auth, device registry, queue |
-| TUI | `textual` | Terminal setup wizard |
-| CLI | `click` | All commands |
-| Tray | `pystray` | System tray icon (Windows) |
+NexSync is a **peer-to-peer file sync tool over LAN using SSH**.
+
+- No cloud  
+- No accounts  
+- No uploads  
+
+Drop a file → it appears everywhere.
 
 ---
 
-## CLI Commands
+##  What is NexSync?
+
+NexSync watches a folder and syncs changes across devices on the same local network using direct SSH transfers.
+
+It’s essentially:
+- AirDrop → but cross-platform  
+- Google Drive → but without Google  
+- rsync → but automated  
+
+---
+
+##  Features
+
+-  Near-instant sync  
+-  Cross-platform (Windows, macOS, Linux)  
+-  Auto-discovery via mDNS (manual fallback included)  
+-  Secure (SSH key-based auth)  
+-  Lightweight (pure Python)  
+
+---
+
+## Built with
+
+| Technology | Purpose |
+|------------|---------|
+| [Python 3.9+](https://python.org) | Core language |
+| [watchdog](https://github.com/gorakhargosh/watchdog) | Real‑time file system monitoring |
+| [paramiko](https://www.paramiko.org/) | SSH / SFTP file transfer |
+| [zeroconf](https://github.com/jstasiak/python-zeroconf) | mDNS auto‑discovery (like AirDrop) |
+| [click](https://click.palletsprojects.com/) | CLI interface |
+| `hashlib` (built‑in) | SHA256 checksums for change detection |
+
+---
+
+##  How It Works
+
+1. File changes detected via watchdog  
+2. File hashed (SHA256)  
+3. Compared with previous snapshot  
+4. Sent via SFTP (SSH)  
+5. Saved on peer  
+
+No cloud. No database. No unnecessary complexity.
+
+---
+
+##  Quick Start
+
+>  First time setting this up?  
+> Follow the full guide → [SETUP.md](./SETUP.md)  
+> (SSH + keys + firewall — the stuff that actually breaks)
+
+
+### Prerequisites
+
+- Python 3.9+
+- SSH enabled on both machines
+- Same local network
+
+---
+
+### Install
+
+```bash
+git clone https://github.com/KiShuKyu/NexSync.git
+cd NexSync
+python -m venv myenv
+source myenv/bin/activate        # Mac/Linux
+myenv\Scripts\activate           # Windows
+pip install -r requirements.txt
+```
+
+---
+
+### Configure
+
+#### Windows
+
+```bash
+python main.py config --set sync_folder D:/NexSync
+python main.py config --set peer_ip 192.168.1.x
+python main.py config --set peer_username your_mac_username
+python main.py config --set ssh_key_path C:/Users/YourUser/.ssh/nexsync_key
+```
+
+#### Mac
+
+```bash
+python3 main.py config --set sync_folder /Users/yourname/NexSync
+python3 main.py config --set peer_ip 192.168.1.y
+python3 main.py config --set peer_username your_windows_username
+python3 main.py config --set ssh_key_path ~/.ssh/nexsync_key
+```
+
+---
+
+### Start
+
+```bash
+python main.py start
+```
+
+If nothing syncs, check your config before assuming the code is broken.
+
+---
+
+##  Commands
 
 | Command | Description |
-|---|---|
-| `python main.py start` | Start the sync daemon |
-| `python main.py status` | Show peer status + pending changes |
-| `python main.py push` | Commit + push to peer |
-| `python main.py pull` | Pull latest from peer |
-| `python main.py pair --mode host` | Pair with another machine (host side) |
-| `python main.py pair --mode join` | Pair with another machine (join side) |
-| `python main.py share <file>` | Share a file with caption |
-| `python main.py queue` | Review queued files waiting to send |
-| `python main.py log` | Show sync history |
-| `python main.py diff` | Show uncommitted changes |
-| `python main.py resolve` | Resolve merge conflicts |
-| `python main.py config` | View config |
-| `python main.py config --set KEY VALUE` | Update a config value |
+|--------|------------|
+| start | Start sync daemon |
+| status | Show config + peers |
+| send <file> | Send file manually |
+| discover | Scan LAN for peers |
+| config --set | Update config |
+| config --show | View config |
 
 ---
 
-## How It Works
+##  Configuration
 
-```
-File changed in sync folder
-        │
-        ▼
-watchdog detects change
-        │
-        ▼
-git commits locally
-        │
-        ▼
-   Peer reachable?
-   /            \
- YES             NO
-  │               │
-  ▼               ▼
-SSH transfer    Save locally
-to peer         Supabase queue
-                updated
-                │
-                ▼
-           Peer comes back online
-           Supabase Realtime fires
-                │
-                ▼
-           Confirm + transfer
-```
+Stored at: ~/.nexsync/config.json
+
+| Key | Description |
+|-----|------------|
+| sync_folder | Folder to watch |
+| peer_ip | Fallback peer |
+| peer_username | SSH username |
+| ssh_key_path | Private key |
+| peer_sync_folder | Remote folder |
+| auto_sync | Enable auto sync |
 
 ---
 
-## Project Structure
+##  Troubleshooting
 
-```
-nexsync/
-├── core/
-│   ├── config.py        # Configuration (~/.nexsync/config.json)
-│   ├── auth.py          # Supabase email/password auth
-│   ├── database.py      # Supabase client wrapper
-│   ├── git_engine.py    # Git operations
-│   ├── watcher.py       # File system monitoring + auto-sync
-│   ├── network.py       # SSH transfer + LAN detection
-│   ├── pairing.py       # UDP broadcast pairing
-│   ├── sharing.py       # File sharing + queue
-│   └── conflict.py      # Conflict detection and resolution
-├── cli/
-│   ├── commands.py      # CLI commands
-│   ├── share_commands.py
-│   └── setup_wizard.py  # Textual TUI setup wizard
-├── ui/
-│   ├── tray.py          # System tray icon
-│   └── share_ui.py      # Share UI
-├── schema.sql           # Supabase database schema
-├── main.py              # Entry point
-├── requirements.txt
-├── setup.py
-└── SETUP.md             # Step-by-step setup guide
-```
+**No peers found?**  
+→ Firewall.
+
+**SSH not connecting?**  
+→ Keys not set properly.
+
+**Files not syncing?**  
+→ Check logs: ~/.nexsync/logs/nexsync.log
 
 ---
 
-## Roadmap
+##  Roadmap
 
-- [x] Git-powered local versioning
-- [x] SSH file transfer on LAN
-- [x] Supabase auth (email + password)
-- [x] Device registry + pairing via Supabase
-- [x] File watcher with auto-sync
-- [x] Textual TUI setup wizard
-- [ ] Supabase Storage for off-network transfers
-- [ ] Supabase Realtime pairing (cross-network)
-- [ ] System tray icon (Windows)
-- [ ] Notifications (plyer)
-- [ ] Custom folder icon
-- [ ] Phase 2: Own FastAPI backend
-- [ ] Phase 3: Go daemon + WinFSP virtual drive
+- ✅ LAN sync  
+- 🔜 Resume transfers  
+- 🔜 Encryption improvements  
+- 🔜 Cloud relay (optional)  
+- 🔜 Dashboard  
+- 🔜 Delta sync  
 
 ---
 
-## Setup
+## Author
 
-See **[SETUP.md](SETUP.md)** for the complete step-by-step setup guide.
+**Krishna Dhiman** — First year CS student.
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?style=flat&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/krishna-dhiman-3669a0300/)
 
 ---
 
-## License
+<div align="center">
+  <sub>Built with watchdog · paramiko · zeroconf · click</sub>
+</div>
 
-MIT — free to use and modify.
